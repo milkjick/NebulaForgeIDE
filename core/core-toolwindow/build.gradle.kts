@@ -1,0 +1,3 @@
+plugins { id("com.android.library"); id("org.jetbrains.kotlin.android"); id("org.jetbrains.kotlin.plugin.compose") }
+android { namespace = "com.nebulaforge.core.toolwindow"; compileSdk = 34; defaultConfig { minSdk = 24 }; buildFeatures { compose = true }; compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }; kotlinOptions { jvmTarget = "17" } }
+dependencies { implementation("androidx.compose.material:material-icons-core:1.7.5"); implementation("androidx.compose.material3:material3:1.3.0"); implementation("androidx.compose.material3:material3-window-size-class:1.3.0"); implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1") }
