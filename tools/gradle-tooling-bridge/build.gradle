@@ -1,0 +1,23 @@
+plugins {
+    id 'java'
+}
+
+repositories {
+    mavenCentral()
+    maven { url = uri('https://repo.gradle.org/gradle/libs-releases') }
+}
+
+dependencies {
+    implementation 'org.gradle:gradle-tooling-api:8.9'
+    runtimeOnly 'org.slf4j:slf4j-simple:2.0.17'
+}
+
+java {
+    toolchain { languageVersion = JavaLanguageVersion.of(17) }
+}
+
+jar {
+    archiveFileName = 'gradle-tooling-bridge.jar'
+    manifest { attributes 'Main-Class': 'com.nebulaforge.bridge.Main' }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
