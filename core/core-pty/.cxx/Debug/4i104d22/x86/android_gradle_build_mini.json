@@ -1,0 +1,27 @@
+{
+  "buildFiles": [
+    "/root/apkbuild/extracted/fcheck/core/core-pty/src/main/cpp/CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "/opt/android-sdk/cmake/3.22.1/bin/ninja",
+      "-C",
+      "/root/apkbuild/extracted/fcheck/core/core-pty/.cxx/Debug/4i104d22/x86",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "/opt/android-sdk/cmake/3.22.1/bin/ninja",
+    "-C",
+    "/root/apkbuild/extracted/fcheck/core/core-pty/.cxx/Debug/4i104d22/x86",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "nebulapty::@6890427a1f51a3e7e1df": {
+      "artifactName": "nebulapty",
+      "abi": "x86",
+      "output": "/root/apkbuild/extracted/fcheck/core/core-pty/build/intermediates/cxx/Debug/4i104d22/obj/x86/libnebulapty.so",
+      "runtimeFiles": []
+    }
+  }
+}
