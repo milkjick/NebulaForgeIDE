@@ -1,0 +1,7 @@
+[
+{
+  "directory": "/root/apkbuild/extracted/fcheck/core/core-pty/.cxx/Debug/4i104d22/x86_64",
+  "command": "/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ --target=x86_64-none-linux-android24 --sysroot=/opt/android-sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Dnebulapty_EXPORTS -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++17 -fexceptions -frtti -fno-limit-debug-info  -fPIC -o CMakeFiles/nebulapty.dir/pty_jni.cpp.o -c /root/apkbuild/extracted/fcheck/core/core-pty/src/main/cpp/pty_jni.cpp",
+  "file": "/root/apkbuild/extracted/fcheck/core/core-pty/src/main/cpp/pty_jni.cpp"
+}
+]
