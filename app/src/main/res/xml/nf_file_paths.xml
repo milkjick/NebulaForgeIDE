@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  系统安装器兜底（ACTION_VIEW 安装 APK）时 FileProvider 可暴露的路径：
+   * files-path   —— Flutter 构建产物在 <filesDir>/home/.nebulaforge/build/…；
+   * cache-path   —— 中转/下载的临时 APK；
+   * external-path —— 公共存储（Gradle 产物落在 /storage/emulated/0/NebulaForgeProjects/…）。
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <files-path name="files" path="." />
+    <cache-path name="cache" path="." />
+    <external-path name="external" path="." />
+</paths>
