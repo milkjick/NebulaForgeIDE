@@ -1,0 +1,5 @@
+plugins { id 'com.android.application' }
+
+android { namespace 'com.nebulaforge.spike'; compileSdk 35
+    defaultConfig { applicationId 'com.nebulaforge.spike'; minSdk 24; targetSdk 35; versionCode 1; versionName '0.1' }
+}
