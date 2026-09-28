@@ -1,0 +1,28 @@
+{
+  "name": "星弦内置插件目录",
+  "version": 1,
+  "note": "随应用打包的离线插件索引，不需要网络即可安装；bundledAsset 指向 assets 内的插件包。",
+  "plugins": [
+    {
+      "id": "com.nebulaforge.plugin.sample-hello",
+      "name": "示例插件 · Hello Nebula",
+      "version": "1.0.0",
+      "vendor": "NebulaForge",
+      "description": "随包内置的示例插件，声明 filesystem:workspace 权限，加载后注册 TOOL_WINDOW 扩展点，用于验证授权弹窗与加载链路。",
+      "iconUrl": "asset://plugins/sample-hello.png",
+      "bundledAsset": "plugins/nebula-sample-hello.zip",
+      "permissions": ["filesystem:workspace"],
+      "extensions": ["TOOL_WINDOW"]
+    },
+    {
+      "id": "com.nebulaforge.plugin.sample-minimal",
+      "name": "示例插件 · 最小骨架",
+      "version": "1.0.0",
+      "vendor": "NebulaForge",
+      "description": "不声明任何权限的最小插件骨架，加载后注册 EDITOR_ACTION 扩展点，用于验证无授权弹窗的直接加载路径。",
+      "iconUrl": "asset://plugins/sample-minimal.png",
+      "bundledAsset": "plugins/nebula-sample-minimal.zip",
+      "extensions": ["EDITOR_ACTION"]
+    }
+  ]
+}
