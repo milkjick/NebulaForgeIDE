@@ -1,0 +1,27 @@
+{
+  "name": "typescript-language-features",
+  "displayName": "TypeScript and JavaScript Language Features",
+  "description": "内置 TypeScript/JavaScript 语言能力占位实现（由 NebulaForge 扩展宿主提供）。",
+  "publisher": "vscode",
+  "version": "1.0.0",
+  "license": "MIT",
+  "engines": {
+    "vscode": "*"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:typescript",
+    "onLanguage:javascript"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "typescriptServerPlugins": [],
+    "configuration": {
+      "type": "object",
+      "title": "TypeScript",
+      "properties": {}
+    }
+  }
+}
