@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NebulaForge 网络策略（开发者工具定位）：
+  1. 保留系统 + 用户 CA 信任锚：用户自建 HTTPS 服务、MITM 抓包调试都需要。
+  2. 允许明文 HTTP：MCP 外部服务器、局域网自建服务、本地代理大量仍是 http://。
+     targetSdk 35 默认禁止明文，会直接报
+     "Cleartext HTTP traffic to 127.0.0.1 not permitted"，
+     导致“添加外部 MCP 服务器”与“内部 MCP 服务”全部不可用。
+     因此在 base-config 显式放开明文，并在 MCP/代理界面提示优先使用 HTTPS。
+  3. 额外显式声明本机地址，作为自文档说明（依赖上文 base-config 已生效）。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>
