@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Nebula Forge 专属图标：星云轨道 + 锻造核心，不使用 Android 默认图标资源。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#E8FCFF" android:pathData="M54,15 L58,27 L70,31 L58,35 L54,47 L50,35 L38,31 L50,27 Z"/>
+    <path android:fillColor="#FFFFFF" android:pathData="M54,33 C66,33 76,43 76,55 C76,67 66,77 54,77 C42,77 32,67 32,55 C32,43 42,33 54,33 Z M54,41 C46.3,41 40,47.3 40,55 C40,62.7 46.3,69 54,69 C61.7,69 68,62.7 68,55 C68,47.3 61.7,41 54,41 Z"/>
+    <path android:fillColor="#2ED6C5" android:pathData="M47,47 L55,47 L61,54 L55,61 L47,61 L53,54 Z"/>
+    <path android:fillColor="#65E7FF" android:pathData="M20,57 C26,73 38,84 54,87 C38,88 23,79 17,64 Z"/>
+    <path android:fillColor="#8B7CFF" android:pathData="M78,35 C88,43 93,54 91,66 C87,54 82,47 74,42 Z"/>
+    <path android:fillColor="#FFFFFF" android:pathData="M82,22 L84,28 L90,30 L84,32 L82,38 L80,32 L74,30 L80,28 Z"/>
+</vector>
