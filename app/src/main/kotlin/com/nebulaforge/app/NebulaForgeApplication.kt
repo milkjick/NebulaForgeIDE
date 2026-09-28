@@ -1,0 +1,3195 @@
+package com.nebulaforge.app
+
+import android.app.Application
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import java.util.UUID
+import com.nebulaforge.core.projectmodel.ProjectTypeRegistry
+import com.nebulaforge.core.session.DiagnosticStore
+import com.nebulaforge.core.session.IdeEvent
+import com.nebulaforge.core.session.Severity
+import com.nebulaforge.core.session.IdeSessionBus
+import com.nebulaforge.core.session.LanguageServiceRegistry
+import com.nebulaforge.core.session.SessionEventJournal
+import com.nebulaforge.core.session.SessionRegistry
+import com.nebulaforge.core.session.WorkspaceStateStore
+import com.nebulaforge.core.mcp.McpHost
+import com.nebulaforge.core.toolchain.ToolchainManager
+import com.nebulaforge.core.aiprovider.ProviderRegistry
+import com.nebulaforge.core.plugin.PluginRuntime
+import com.nebulaforge.stack.android.AndroidProjectType
+import com.nebulaforge.app.ai.AiTaskPhase
+import com.nebulaforge.app.ai.AiToolCall
+import com.nebulaforge.app.ai.AiToolProtocol
+import com.nebulaforge.app.ai.AiToolResult
+import com.nebulaforge.app.ai.AiChatMessage
+import com.nebulaforge.app.ai.AiChatStore
+import com.nebulaforge.app.ai.AiChatUiState
+import com.nebulaforge.app.ai.AiMessageRole
+import com.nebulaforge.app.ai.AiSessionMeta
+import com.nebulaforge.app.plugins.DeclarativePluginLoader
+import com.nebulaforge.app.ai.estimateTokens
+import com.nebulaforge.stack.flutter.FlutterProjectType
+import com.nebulaforge.stack.web.TypeScriptProjectType
+import com.nebulaforge.stack.web.WebBackendProjectType
+import com.nebulaforge.stack.web.WebFrontendProjectType
+import com.nebulaforge.stack.cpp.CppProjectType
+import com.nebulaforge.core.session.RunCenterStore
+import com.nebulaforge.core.session.StackRunController
+import com.nebulaforge.core.agent.AgentPlan
+import com.nebulaforge.core.agent.AgentPlanAction
+import com.nebulaforge.core.agent.AgentPlanStatus
+import com.nebulaforge.core.agent.AgentPlanStep
+import com.nebulaforge.core.agent.AgentPlanStepStatus
+
+/** Shared IDE runtime state: one diagnostic source and one event bus for editor/build/problems. */
+class NebulaForgeApplication : Application(), com.nebulaforge.app.ai.TaskToolRuntime {
+    lateinit var workspaceState: WorkspaceStateStore
+        private set
+    lateinit var diagnosticStore: DiagnosticStore
+        private set
+    lateinit var sessionBus: IdeSessionBus
+        private set
+    lateinit var languageServices: LanguageServiceRegistry
+        private set
+
+    /**
+     * 工作区任务执行器（VSCode 式「点构建 → 终端里跑 tasks.json」）。
+     *
+     * 放在 Application 而不是某个 Composable：构建是**长任务**，底部面板切 tab、
+     * 工具窗折叠、甚至切到别的页面都不能中断它，状态也必须还在。
+     */
+    val workspaceTasks by lazy { com.nebulaforge.app.build.WorkspaceTaskRunner(this, sessionBus, diagnosticStore) }
+    lateinit var runCenter: RunCenterStore
+        private set
+    lateinit var stackRunController: StackRunController
+        private set
+    lateinit var runConfigurations: com.nebulaforge.core.session.RunConfigurationStore
+        private set
+    lateinit var unifiedRunController: com.nebulaforge.core.session.UnifiedRunController
+        private set
+    lateinit var runDevices: com.nebulaforge.core.session.RunDeviceCatalog
+        private set
+    lateinit var sessionGraph: com.nebulaforge.core.session.SessionGraphStore
+        private set
+    lateinit var sessionStateProjection: com.nebulaforge.core.session.SessionStateProjection
+        private set
+    lateinit var problemNavigation: com.nebulaforge.core.session.ProblemNavigationStore
+        private set
+    lateinit var buildFixCoordinator: com.nebulaforge.core.agent.BuildFixCoordinator
+        private set
+    lateinit var mcpHost: McpHost
+        private set
+    lateinit var pluginRuntime: PluginRuntime
+        private set
+    lateinit var toolchainManager: ToolchainManager
+        private set
+    lateinit var toolchainDoctor: com.nebulaforge.core.toolchain.ToolchainDoctor
+        private set
+    lateinit var aiProviders: ProviderRegistry
+        private set
+    private lateinit var agentPlanStore: com.nebulaforge.core.agent.AgentPlanStore
+    private lateinit var agentPlanner: com.nebulaforge.core.agent.AiAgentPlanner
+    private lateinit var projectMemoryStore: com.nebulaforge.core.agent.ProjectMemoryStore
+    private lateinit var agentExperienceStore: com.nebulaforge.core.agent.AgentExperienceStore
+    private lateinit var agentLearningService: com.nebulaforge.core.agent.AgentLearningService
+    private lateinit var vectorRagService: com.nebulaforge.core.agent.VectorRagService
+    private lateinit var failurePatternStore: com.nebulaforge.core.agent.FailurePatternStore
+    private lateinit var agentFinalFService: com.nebulaforge.core.agent.AgentFinalFService
+    private val agentWebSearch = com.nebulaforge.core.agent.AgentWebSearchService()
+    /** 设备提权通道（Root / Shizuku / 内嵌 bootstrap）统一网关。 */
+    private val embeddedShellRunner by lazy { com.nebulaforge.core.environment.EmbeddedShellRunner(this) }
+
+    /**
+     * AI 终端桥：三重闸门（用户开关 + 命令策略 + 审计）后的设备命令执行入口。
+     *
+     * 用 lazy 而不是在属性初始化期构造：Application 的属性初始化发生在 attachBaseContext 之前，
+     * 那时 applicationContext 还不可用，直接构造会拿到空 Context。
+     */
+    val aiTerminal by lazy { com.nebulaforge.core.device.AiTerminalBridge(this) }
+
+    /** 通道偏好与 AI 终端开关的读写入口，供设置页使用。 */
+    val deviceAccessPrefs by lazy { com.nebulaforge.core.device.DeviceAccessPrefs(this) }
+
+    /** 当前生效通道的状态摘要（设置页 / AI 上下文共用）。 */
+    /**
+     * 需要时重建工作区符号索引（同项目重复调用直接返回）。
+     *
+     * 扫描在 IO 线程执行：调用方多半是「打开文件」这类 UI 路径，绝不能让它等扫描。
+     */
+    fun rebuildWorkspaceIndexIfNeeded(root: java.io.File) {
+        if (editorIndex.lastIndexedRoot() == root.absolutePath) return
+        indexScope.launch { runCatching { editorIndex.rebuild(root) } }
+    }
+
+    /** 强制重建（保存文件 / 新建文件后调用，让新符号马上能补全出来）。 */
+    fun rebuildWorkspaceIndex(root: java.io.File) {
+        indexScope.launch { runCatching { editorIndex.rebuild(root) } }
+    }
+
+    fun deviceChannelSummary(): String = com.nebulaforge.core.device.DeviceShellGate.statusSummary(this)
+
+    // 初始值给 NOT_RUNNING：真正状态在 onCreate 里 attach 完成后通过 installListeners 的 sticky 回调写入。
+    private val _shizukuState = MutableStateFlow(com.nebulaforge.core.device.ShizukuStatus.NOT_RUNNING)
+
+    /** Shizuku 权限/服务状态流：授权弹窗结果与 binder 连接变化都会推到这里。 */
+    val shizukuState: StateFlow<com.nebulaforge.core.device.ShizukuStatus> = _shizukuState.asStateFlow()
+
+    /** 重新检测设备权限（Shizuku 状态 + Root 探测），并把结果同步到状态流。 */
+    fun refreshDeviceAccess() {
+        _shizukuState.value = com.nebulaforge.core.device.ShizukuAccess.status(this)
+        com.nebulaforge.core.device.RootAccess.isAvailable(forceRefresh = true)
+    }
+    private lateinit var agentPlanRunner: com.nebulaforge.core.agent.AgentPlanRunner
+    lateinit var reverseEvidence: com.nebulaforge.app.reverse.ReverseEvidenceStore
+        private set
+    private val agentScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    /**
+     * 工作区符号索引：编辑器跨文件补全的数据源（离线、行级正则提取）。
+     *
+     * 放 Application 级是因为「打开项目 → 扫一遍 → 所有文件共用」：
+     * 放在编辑器页面里会导致每开一个文件重扫一次工程（大工程直接卡输入）。
+     */
+    val editorIndex by lazy { com.nebulaforge.core.editor.intel.WorkspaceSymbolIndex() }
+
+    private val indexScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val _agentPlanState = MutableStateFlow(AgentPlanUiState())
+    val agentPlanState: StateFlow<AgentPlanUiState> = _agentPlanState.asStateFlow()
+
+    /**
+     * 工作台「自动兜底计划」的 id。
+     *
+     * 只允许继续往这份计划里追加步骤；模型自己通过 propose_plan 立的计划一旦接管
+     * （见 [registerPlan] 会把它置空），工作台就不再插手，免得把两边的步骤搅在一起。
+     */
+    private var autoPlanId: String? = null
+
+    // ---------------------------------------------------------------- 任务中心：多任务列表的用户选择
+
+    /**
+     * 任务行是**派生**的（[com.nebulaforge.app.ai.TaskBoardBuilder] 由计划/运行态/tasks.json 实时算出），
+     * 需要落盘的只有用户对行的两个选择：删了哪些、禁用了哪些。
+     * 以前面板只能靠「运行历史」堆行，用户无法清掉不要的条目 —— 参考图里行尾的 `×` 就是干这个的。
+     */
+    private val taskBoardStore by lazy { com.nebulaforge.app.ai.TaskBoardStore(this) }
+
+    private val _boardDismissed by lazy { MutableStateFlow(taskBoardStore.dismissed()) }
+    val boardDismissed: StateFlow<Set<String>> get() = _boardDismissed
+
+    private val _boardDisabled by lazy { MutableStateFlow(taskBoardStore.disabled()) }
+    val boardDisabled: StateFlow<Set<String>> get() = _boardDisabled
+
+    /** 删除一行任务（跨重启生效）。 */
+    fun dismissBoardTask(id: String) {
+        taskBoardStore.dismiss(id)
+        _boardDismissed.value = taskBoardStore.dismissed()
+    }
+
+    /** 恢复全部被删除的行。 */
+    fun restoreBoardTasks() {
+        taskBoardStore.restoreAll()
+        _boardDismissed.value = emptySet()
+    }
+
+    /** 切换一行的启用状态（对应参考图的「已禁用」）。 */
+    fun setBoardTaskDisabled(id: String, disabled: Boolean) {
+        taskBoardStore.setDisabled(id, disabled)
+        _boardDisabled.value = taskBoardStore.disabled()
+    }
+
+    /** 7.4 聊天模式状态：纯文本对话，与任务模式（Agent 计划）状态完全隔离 */
+    /**
+     * 附件准备（复制大文件、解包抽条目清单、图片压缩）专用的作用域。
+     * 放 IO 线程且不随界面重建销毁 —— 用户选完文件立刻返回时，后台仍会把它处理完。
+     */
+    private val attachScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private val _chatState = MutableStateFlow(AiChatUiState())
+    val chatState: StateFlow<AiChatUiState> = _chatState.asStateFlow()
+
+    /** 会话持久化：消息落盘，切页/进程重启后历史仍在（旧实现只存内存，重启即丢，看起来像「对话被截断」）。 */
+    private val chatStore by lazy { AiChatStore(this) }
+
+    /** 快捷指令：长按消息「转为快捷指令 / 添加到快捷指令列表」落在这里，跨会话复用。 */
+    private val shortcutStore by lazy { com.nebulaforge.app.ai.AiShortcutStore(this) }
+
+    private val _shortcuts = MutableStateFlow<List<com.nebulaforge.app.ai.AiShortcut>>(emptyList())
+
+    /** 快捷指令列表（输入框上方的 chip 行读它）。 */
+    val shortcuts: StateFlow<List<com.nebulaforge.app.ai.AiShortcut>> = _shortcuts.asStateFlow()
+
+    /** 当前生成任务：支撑「停止生成」，并保证同一时刻只有一次生成在跑。 */
+    private var chatJob: kotlinx.coroutines.Job? = null
+
+    /** 工具卡片去重：记录已经转成卡片展示过的「计划步骤 id + 状态」。 */
+    private val recordedToolSteps = mutableSetOf<String>()
+
+    // ---------------------------------------------------------------- AI 工作台（任务模式）
+
+    /** 能力中心：联网检索、项目记忆、经验库、妙招、技能等聚合入口。 */
+    override val capabilities by lazy { com.nebulaforge.core.agent.AgentCapabilities(this) }
+
+    /** 命令 / 写文件的挂起式审批（AI 不能绕开用户直接改设备或改代码）。 */
+    override val approvalBroker = com.nebulaforge.app.ai.TaskApprovalBroker()
+
+    override val toolContext: android.content.Context get() = this
+
+    private val taskToolHost by lazy { com.nebulaforge.app.ai.AiTaskToolHost(this) }
+
+    /** 工作台开关（联网/允许命令/允许写文件）持久化：用户设过一次就不用每次重设。 */
+    private val taskFlags by lazy { getSharedPreferences("nebulaforge.workbench.xml", MODE_PRIVATE) }
+
+    private val KEY_ONLINE = "online"
+    private val KEY_ALLOW_COMMAND = "allow_command"
+    private val KEY_ALLOW_WRITE = "allow_write"
+    private val KEY_AUTO_APPROVE = "auto_approve_all"
+
+    override fun currentProjectPath(): String? = workspaceState.state.value.projectPath
+
+    // ---------------------------------------------- 宿主能力网关（AI / 插件 / 外部网关共用）
+
+    /**
+     * 给 AI 看的能力目录（同一份渲染也用在插件诊断面板，保证「AI 看到的」= 「用户看到的」）。
+     *
+     * 用 fully-qualified 名字直接取 `JsExtensionHost.of(this)`（与 [startJsExtensionHost] 同源）：
+     * 这样「宿主根本没起来」这种情况会如实变成一句可读的失败说明，而不是假装目录是空的。
+     */
+    override fun hostCapabilityCatalog(): String = runCatching {
+        com.nebulaforge.app.plugins.JsExtensionHost.of(this).capabilityCatalogText()
+    }.getOrElse { "能力目录读取失败：${it.message ?: it.javaClass.simpleName}" }
+
+    /**
+     * AI 调宿主能力：caller 固定 `agent`，因此审计里能分清「这是 AI 动的」还是「插件动的」。
+     *
+     * 注意这里不做任何"自动放行"捷径 —— 写入 / 执行 / 模型调用一律由网关请用户当场授权，
+     * 用户答「始终允许」才会落盘记住。AI 想绕开授权是不可能的，这正是这层存在的意义。
+     */
+    override suspend fun invokeHostCapability(
+        capability: String,
+        arguments: org.json.JSONObject
+    ): String = runCatching {
+        val result = com.nebulaforge.app.plugins.JsExtensionHost.of(this)
+            .invokeCapability("agent", capability, arguments)
+        if (result.ok) result.text else "失败：${result.text}"
+    }.getOrElse { "调用异常：${it.message ?: it.javaClass.simpleName}" }
+
+    override fun hostCapabilityAudit(limit: Int): String = runCatching {
+        com.nebulaforge.app.plugins.JsExtensionHost.of(this).capabilityAuditText(limit)
+    }.getOrElse { "审计读取失败：${it.message ?: it.javaClass.simpleName}" }
+
+    /**
+     * 切换到某个项目目录（AI 工作台「项目」面板、AI 的 create_project 工具都走这里）。
+     * 外部目录同时登记进「就地打开」列表，重启后仍然出现在项目列表里。
+     */
+    override fun selectProject(path: String) {
+        val dir = java.io.File(path)
+        if (dir.isDirectory && !isManagedProject(dir)) registerExternalRoot(dir)
+        workspaceState.selectProject(dir.absolutePath)
+    }
+
+    // ───────────────────────── 项目管理（手动新增 / 删除 / 重命名 / 切换） ─────────────────────────
+    // 用户反馈原话：「这个项目功能无法手动新增删除和管理项目」。以前只有「项目页」里能建，
+    // AI 工作台的「项目」面板只能看一行路径。这里把整套管理动作下沉成 Application 级 API，
+    // 面板与 AI 工具（create_project）共用同一份实现，避免两处逻辑漂移。
+
+    private val KEY_EXTRA_ROOTS = "paths"
+    private val PREFS_EXTRA_ROOTS = "nebula_forge_workspace_extra_roots"
+
+    /** 受管项目根目录：受管项目 = 该目录下的每个子目录。 */
+    fun projectsRootDir(): java.io.File =
+        java.io.File(com.nebulaforge.core.environment.Environment.projectsDir(this)).also { it.mkdirs() }
+
+    /** 项目列表 = 受管项目 + 登记过的外部工程目录（与项目页同一个列表，顺序一致）。 */
+    fun listAllProjects(): List<java.io.File> {
+        val root = projectsRootDir()
+        val managed = root.listFiles()?.filter { it.isDirectory }.orEmpty()
+        val extra = externalRoots().filter { it.absolutePath != root.absolutePath }
+        return (managed + extra).distinctBy { it.absolutePath }.sortedBy { it.name.lowercase() }
+    }
+
+    private fun extraRootPrefs() = getSharedPreferences(PREFS_EXTRA_ROOTS, MODE_PRIVATE)
+
+    fun externalRoots(): List<java.io.File> = extraRootPrefs()
+        .getStringSet(KEY_EXTRA_ROOTS, emptySet()).orEmpty()
+        .map { java.io.File(it) }.filter { it.isDirectory }.distinctBy { it.absolutePath }
+
+    private fun isManagedProject(dir: java.io.File): Boolean =
+        dir.absolutePath.trimEnd('/').startsWith(projectsRootDir().absolutePath.trimEnd('/') + "/")
+
+    /** 登记「就地打开」的外部工程目录：**只记路径，不动用户文件**。 */
+    fun registerExternalRoot(dir: java.io.File) {
+        val set = extraRootPrefs().getStringSet(KEY_EXTRA_ROOTS, emptySet()).orEmpty().toMutableSet()
+        if (set.add(dir.absolutePath)) extraRootPrefs().edit().putStringSet(KEY_EXTRA_ROOTS, set).apply()
+    }
+
+    /** 从项目列表移除：外部工程**只取消登记**，不删任何文件。 */
+    fun forgetProjectRoot(path: String) {
+        val set = extraRootPrefs().getStringSet(KEY_EXTRA_ROOTS, emptySet()).orEmpty().toMutableSet()
+        if (set.remove(path)) extraRootPrefs().edit().putStringSet(KEY_EXTRA_ROOTS, set).apply()
+        if (workspaceState.state.value.projectPath == path) workspaceState.selectProject(null)
+    }
+
+    /** 新建受管项目目录（重名自动加后缀）。 */
+    fun createProjectDir(name: String): java.io.File {
+        val safe = name.trim().ifBlank { "project" }.replace(Regex("[\\\\/:*?\"<>|]"), "-")
+        var dir = java.io.File(projectsRootDir(), safe)
+        var i = 2
+        while (dir.exists()) { dir = java.io.File(projectsRootDir(), "$safe-$i"); i++ }
+        dir.mkdirs()
+        return dir
+    }
+
+    /** 重命名项目目录（同父目录内改名），并同步「当前项目」与外部根登记。 */
+    fun renameProjectDir(dir: java.io.File, newName: String): java.io.File? {
+        val safe = newName.trim().replace(Regex("[\\\\/:*?\"<>|]"), "-")
+        if (safe.isBlank()) return null
+        val target = java.io.File(dir.parentFile, safe)
+        if (target.exists()) return null
+        if (!dir.renameTo(target)) return null
+        if (workspaceState.state.value.projectPath == dir.absolutePath) {
+            workspaceState.selectProject(target.absolutePath)
+        }
+        val extras = extraRootPrefs().getStringSet(KEY_EXTRA_ROOTS, emptySet()).orEmpty().toMutableSet()
+        if (extras.remove(dir.absolutePath)) {
+            extras.add(target.absolutePath)
+            extraRootPrefs().edit().putStringSet(KEY_EXTRA_ROOTS, extras).apply()
+        }
+        return target
+    }
+
+    /**
+     * 删除项目。受管项目（在 NebulaForgeProjects 下）**真删目录**；
+     * 外部工程只从列表移除、文件保留（避免误删用户随手挂进来的系统目录）。
+     */
+    fun deleteProjectDir(dir: java.io.File): Boolean {
+        if (!isManagedProject(dir)) { forgetProjectRoot(dir.absolutePath); return true }
+        val ok = dir.deleteRecursively()
+        if (workspaceState.state.value.projectPath == dir.absolutePath) workspaceState.selectProject(null)
+        return ok
+    }
+
+    /**
+     * MCP 宿主交给工具执行器：MCP 工具（内置项目服务 + 远端服务）由此真正可达。
+     * `mcpHost` 是 lateinit（Application.onCreate 里创建），未初始化时返回 null 由调用方兜底。
+     */
+    override val mcpToolHost: com.nebulaforge.core.mcp.McpHost?
+        get() = if (::mcpHost.isInitialized) mcpHost else null
+
+    override fun execOnDevice(command: String, timeoutMs: Long): String = aiTerminal.execForAi(command, timeoutMs)
+
+    // ======================================================================
+    // AI 工具台 · 构建能力桥接（build_project / run_app / toolchain_status / create_project）
+    //
+    // 真机反馈「AI 工作台无法调用编译环境」的根因是三层错位：
+    //   ① 工具台里没有任何构建工具（只有 read/write/ls/run_command…）；
+    //   ② AI 唯一能跑命令的通道 run_command 走的是设备 shell（Shizuku / toybox），
+    //      而 JDK / Gradle / Android SDK / Flutter / Node 只装在 proot 用户态里；
+    //   ③ 构建中心（BuildCenterScreen）虽有完整能力，但那是界面按钮，AI 够不着。
+    // 下面把②③接起来：新增构建工具 + 给 run_command 加「项目工具链用户态」通道。
+    // ======================================================================
+
+    /** 构建工具链环境变量：JDK + Android SDK + build-tools + Gradle 用户目录（供 proot 通道使用）。 */
+    private fun toolchainEnv(): Map<String, String> = buildMap {
+        putAll(com.nebulaforge.core.environment.Environment.buildSdkEnv(this@NebulaForgeApplication))
+        val sdk = com.nebulaforge.core.environment.Environment.androidSdkRoot(this@NebulaForgeApplication)
+        put("ANDROID_HOME", sdk)
+        put("ANDROID_SDK_ROOT", sdk)
+        put("GRADLE_USER_HOME", com.nebulaforge.core.environment.Environment.gradleUserHome(this@NebulaForgeApplication))
+        put("HOME", com.nebulaforge.core.environment.Environment.homeRoot(this@NebulaForgeApplication))
+    }
+
+    /**
+     * 在「项目工具链用户态」（proot + JDK/Gradle/SDK/Flutter/Node）执行命令。
+     *
+     * 与 [execOnDevice] 的关键区别：设备 shell 里没有构建工具链，所以在那边手写 gradle 必然
+     * command not found —— 这正是「AI 用不了编译环境」的真机表现。
+     */
+    override suspend fun execInToolchain(command: String, cwd: String?, timeoutMs: Long): String =
+        withContext(Dispatchers.IO) {
+            val trimmed = command.trim()
+            if (trimmed.isEmpty()) return@withContext "命令为空，未执行。"
+            val shell = com.nebulaforge.core.environment.Environment.resolveShell(this@NebulaForgeApplication)
+            val workDir = cwd?.let { File(it) }?.takeIf { it.isDirectory }
+                ?: File(com.nebulaforge.core.environment.Environment.homeRoot(this@NebulaForgeApplication))
+            val out = StringBuilder()
+            var exit = -1
+            val executor = com.nebulaforge.core.exec.TermuxCommandExecutor(shell, guestAware = true)
+            val completed = runCatching {
+                withTimeoutOrNull(timeoutMs) {
+                    executor.execute(trimmed, workDir, toolchainEnv()).collect { ev ->
+                        when (ev) {
+                            is com.nebulaforge.core.exec.TermuxCommandExecutor.Event.Line ->
+                                if (out.length < 200_000) out.appendLine(ev.text)
+                            is com.nebulaforge.core.exec.TermuxCommandExecutor.Event.Finished -> exit = ev.exitCode
+                        }
+                    }
+                    true
+                }
+            }
+            completed.onFailure { out.appendLine("执行异常：" + (it.message ?: it.javaClass.simpleName)) }
+            val timedOut = completed.getOrNull() == null
+            buildString {
+                append("[项目工具链用户态] ").append(workDir.absolutePath).append('\n')
+                append(out)
+                append("退出码=").append(if (timedOut) -1 else exit)
+                if (timedOut) append("（超时 ${timeoutMs / 1000}s）")
+            }
+        }
+
+    /**
+     * 幂等注册「项目级 MCP Server」。
+     *
+     * 这个 Server 提供 run_build（按运行配置构建）等工具，但历史上只在 WorkspaceScreen
+     * 打开时才注册 —— 用户在 AI 工作台里直接说话时，AI 的 mcp_call 根本看不到项目 Server。
+     * 已注册（界面那一路）时直接跳过，避免覆盖。
+     */
+    fun ensureProjectMcpRegistered(root: File?) {
+        if (root == null || !root.isDirectory) return
+        val id = "project:${root.absolutePath}"
+        val exists = runCatching { mcpHost.internalServers().contains(id) }.getOrDefault(false)
+        if (exists) return
+        runCatching {
+            val server = com.nebulaforge.core.mcp.InternalMcpServer(
+                root,
+                buildHandler = { task ->
+                    val configs = runConfigurations.forProject(root)
+                    val spec = configs.firstOrNull { it.id == task } ?: configs.firstOrNull()
+                    if (spec == null) {
+                        org.json.JSONObject().put("success", false).put("message", "当前项目没有 Run Configuration")
+                    } else {
+                        unifiedRunController.build(spec).collect { }
+                        org.json.JSONObject().put("success", true)
+                            .put("configurationId", spec.id).put("message", "构建任务已完成")
+                    }
+                },
+                // 项目 Server 也带上逆向工具：这样「聚合网关/外部客户端」连任意一个 Server 都能看到完整逆向能力。
+                extraTools = reverseMcpExtraTools()
+            )
+            mcpHost.registerInternal(id, server)
+        }.onFailure { android.util.Log.w("NbMcp", "项目 MCP 注册失败：${it.message ?: it.javaClass.simpleName}") }
+    }
+
+    /**
+     * 把逆向能力注册成一个**独立于项目**的内部 MCP Server（id = `reverse`）。
+     *
+     * 为什么不能只挂在项目 Server 上：项目 Server（`project:<path>`）只在打开项目时存在，
+     * 用户在 AI 工作台直接提问、或还没选项目时，`tools/list` 里就看不到任何逆向工具 ——
+     * 这正是「MCP 面板显示就绪、模型却调不到逆向能力」的根因。这里固定注册一个常驻 Server，
+     * 让 APK 解包 / Web 抓包 / 接口与 OpenAPI / 代理开关 / CA 安装始终可被 Agent 与聚合网关调用。
+     */
+    fun ensureReverseMcpRegistered() {
+        if (runCatching { mcpHost.internalServers().contains(REVERSE_MCP_ID) }.getOrDefault(false)) return
+        runCatching {
+            val server = com.nebulaforge.core.mcp.InternalMcpServer(
+                filesDir,
+                extraTools = reverseMcpExtraTools()
+            )
+            mcpHost.registerInternal(REVERSE_MCP_ID, server)
+        }.onFailure { android.util.Log.w("NbMcp", "逆向 MCP 注册失败：${it.message ?: it.javaClass.simpleName}") }
+    }
+
+    /**
+     * 逆向能力 → MCP 工具表（项目 Server 与常驻 `reverse` Server 共用同一份装配）。
+     *
+     * 只做参数翻译，真正的实现仍在 [reverseApk]/[reverseWeb]/[reverseApi]/[caCertificate]，
+     * 这样 MCP 通道与 AI 工具通道的行为不会各写一套而逐渐漂移。
+     */
+    fun reverseMcpExtraTools(): Map<String, Pair<com.nebulaforge.core.mcp.McpToolDefinition, suspend (org.json.JSONObject) -> org.json.JSONObject>> =
+        com.nebulaforge.app.reverse.ReverseMcpTools.toolsFor(
+            apkReverse = { action, path, file, content, out -> reverseApk(action, path, file, content, out) },
+            webReverse = { action, url, limit -> reverseWeb(action, url, limit) },
+            apiReverse = { action, filter, port -> reverseApi(action, filter, port) },
+            caCertificate = { action -> caCertificate(action) }
+        )
+
+    /** 识别项目构建类型 → 决定用哪条构建链路。 */
+    private fun detectBuildKind(root: File): String = when {
+        File(root, "settings.gradle").exists() || File(root, "settings.gradle.kts").exists() ||
+            File(root, "build.gradle").exists() || File(root, "build.gradle.kts").exists() -> "gradle"
+        File(root, "pubspec.yaml").exists() -> "flutter"
+        File(root, "package.json").exists() -> "node"
+        File(root, "go.mod").exists() -> "go"
+        else -> "unknown"
+    }
+
+    /** Flutter 顶级子命令：出现这些词说明 AI 给的就是完整子命令，直接透传。 */
+    private val flutterTopCommands = setOf(
+        "build", "run", "test", "clean", "pub", "analyze", "doctor", "install", "devices",
+        "emulators", "create", "upgrade", "downgrade", "packages", "gen", "format", "attach",
+        "drive", "symbolize", "config", "logs", "precache", "channel", "assemble"
+    )
+
+    /**
+     * 把 AI 给的 task 归一化成**合法**的 flutter 子命令。
+     *
+     * 历史 bug（用户实测）：task="apk" 被直接拼成 `flutter apk` —— 这不是合法子命令，构建必然失败。
+     * 现在：apk → build apk、release → build apk --release、clean → clean、完整子命令原样透传。
+     */
+    private fun normalizeFlutterTask(raw: String?): String {
+        val t = raw?.trim().orEmpty()
+        if (t.isBlank()) return "build apk --debug"
+        val body = t.removePrefix("flutter").trim()
+        if (body.isBlank()) return "build apk --debug"
+        val head = body.substringBefore(' ').lowercase()
+        val rest = body.substringAfter(' ', "").trim()
+        if (head in flutterTopCommands) return body
+        return when (head) {
+            "debug" -> "build apk --debug"
+            "release" -> "build apk --release"
+            "profile" -> "build apk --profile"
+            "aab", "appbundle" -> "build appbundle" + (if (rest.isBlank()) "" else " $rest")
+            "bundle" -> "build bundle" + (if (rest.isBlank()) "" else " $rest")
+            else -> "build $body"
+        }
+    }
+
+    /**
+     * 把 AI 给的 task 归一化成合法的 npm 命令（默认 `npm run build`）。
+     * 兼容：build / run build / test / install / ci / start。
+     */
+    private fun normalizeNodeTask(raw: String?): String {
+        val t = raw?.trim().orEmpty()
+        if (t.isBlank()) return "npm run build"
+        if (t.startsWith("npm ")) return t
+        val head = t.substringBefore(' ').lowercase()
+        return if (head in setOf(
+                "run", "install", "ci", "test", "start", "update", "audit", "init", "publish", "exec", "ls"
+            )
+        ) "npm $t" else "npm run $t"
+    }
+
+    /**
+     * 把 AI 给的 task 归一化成合法的 Gradle 任务名。
+     * 兼容 AI 的自然说法：debug/apk/build → assembleDebug；release → assembleRelease；
+     * 也支持直接给 assembleRelease / clean / installDebug 等真实任务名与 :module 语法。
+     */
+    private fun normalizeGradleTask(task: String?, module: String?): String {
+        val t = task?.trim().orEmpty()
+        val base = when (t.lowercase()) {
+            "", "build", "debug", "apk", "assemble", "package" -> "assembleDebug"
+            "release", "assemble-release" -> "assembleRelease"
+            else -> t
+        }
+        val bareName = base.trim().trimStart(':').substringAfterLast(':').ifBlank { "assembleDebug" }
+        return if (module.isNullOrBlank()) base else ":" + module.trim().trimStart(':') + ":" + bareName
+    }
+
+    /** 构建会话结束信号（用于从事件流里跳出）。 */
+    private class BuildSessionDone : RuntimeException(null, null, false, false)
+
+    /**
+     * 编译 / 打包当前项目。Gradle 走 [com.nebulaforge.core.session.BuildSessionManager]（与构建中心同源，
+     * 因此支持 assembleDebug / assembleRelease / clean 等任意任务），其它技术栈走各自构建命令。
+     */
+    override suspend fun buildProject(
+        projectPath: String, task: String?, module: String?, cleanFirst: Boolean, timeoutMs: Long
+    ): String = withContext(Dispatchers.IO) {
+        val root = File(projectPath)
+        if (!root.isDirectory) return@withContext "✗ 项目目录不存在：$projectPath"
+        when (detectBuildKind(root)) {
+            "gradle" -> buildGradleProject(root, task, module, cleanFirst, timeoutMs)
+            "flutter" -> {
+                val cmd = "flutter " + normalizeFlutterTask(task)
+                execInToolchain((if (cleanFirst) "flutter clean && " else "") + cmd, root.absolutePath, timeoutMs)
+            }
+            "node" -> {
+                val cmd = normalizeNodeTask(task)
+                execInToolchain((if (cleanFirst) "npm run clean && " else "") + cmd, root.absolutePath, timeoutMs)
+            }
+            "go" -> execInToolchain(task?.trim()?.takeIf { it.isNotBlank() } ?: "go build ./...", root.absolutePath, timeoutMs)
+            else -> buildString {
+                append("✗ 未识别的构建系统：").append(root.absolutePath).append('\n')
+                append("已检查 settings.gradle / build.gradle / pubspec.yaml / package.json / go.mod，均不存在。\n")
+                append("建议：先用 list_files 确认项目结构，确认项目类型后再决定构建方式。")
+            }
+        }
+    }
+
+    /**
+     * Gradle 项目的构建实现。
+     *
+     * ## 为什么改走 [workspaceTasks]（工作区任务执行器）
+     * 旧实现自己 collect `BuildSessionManager`，构建日志只回流给 AI、**不进任何 UI 状态**。
+     * 真机表现就是：「AI 让构建时，任务中心/构建面板既不显示已用时长，也没有停止按钮；
+     * 失败或超时之后 guest 里的 Gradle 还在继续吃 CPU」。
+     * [com.nebulaforge.app.build.WorkspaceTaskRunner] 是构建中心与任务中心早已在用的执行器，自带
+     *   · 实时 `TaskRunState`（running / startedAt / durationMs / exitCode / message）
+     *   · 逐行输出流（面板与任务卡片直接消费，含「已用 Ns」）
+     *   · `stop()` = 取消执行 Job + 关掉 pty，真正杀掉 guest 里的进程
+     * 统一到它之后，AI 发起的构建与用户手点的构建是同一条链路、同一份状态，
+     * 也就天然支持「失败 / 超时 / 用户点停止」。
+     */
+    private suspend fun buildGradleProject(
+        root: File, task: String?, module: String?, cleanFirst: Boolean, timeoutMs: Long
+    ): String = withContext(Dispatchers.IO) {
+        val project = runCatching { com.nebulaforge.core.projectmodel.ProjectResolver().resolve(root) }.getOrNull()
+            ?: return@withContext "✗ 无法识别为可构建的 Gradle 项目：${root.absolutePath}"
+        val toolchain = com.nebulaforge.core.toolchain.ProjectToolchainResolver(this@NebulaForgeApplication)
+        val env = runCatching { toolchain.resolve(project) }.getOrNull()
+            ?: return@withContext "✗ 工具链解析失败：${root.absolutePath}"
+        if (!env.ready) {
+            return@withContext buildString {
+                append("✗ 项目构建工具链未就绪，无法编译：\n")
+                env.issues.forEach { append("  - ").append(it).append('\n') }
+                append("下一步：用 install_env 安装缺失组件（JDK / Android SDK / build-tools），再重试 build_project。")
+            }
+        }
+        runCatching { toolchain.syncLocalProperties(env) }
+
+        val gradleTask = normalizeGradleTask(task, module)
+        val commandLine = if (cleanFirst) "clean $gradleTask" else gradleTask
+        runTaskInWorkspace(
+            root = root,
+            label = "AI 构建 · $gradleTask",
+            commandLine = commandLine,
+            kind = com.nebulaforge.core.session.SessionKind.BUILD,
+            timeoutMs = timeoutMs
+        )
+    }
+
+    /**
+     * 把一次构建/运行交给工作区任务执行器，并把它**等成一次同步结果**（AI 工具调用需要文本回执）。
+     *
+     * 关键点：
+     *  1. 先等 `running=true`，再等 `!running`：`runCommand` 是「同步置位运行态 + 异步做准备」，
+     *     直接等结束会命中**上一次任务的结束态**而秒返回（假完成，正是「构建流程不可靠」的来源）。
+     *  2. 超时/取消一律调 [com.nebulaforge.app.build.WorkspaceTaskRunner.stop]，
+     *     由它取消执行 Job 并关闭 pty —— 这才是「超时后真的停下来」。
+     *  3. 只取本次新增的输出行（`drop(before)`），不把用户上一次手动构建的日志混进回执。
+     */
+    private suspend fun runTaskInWorkspace(
+        root: File,
+        label: String,
+        commandLine: String,
+        kind: com.nebulaforge.core.session.SessionKind,
+        timeoutMs: Long
+    ): String {
+        val before = workspaceTasks.output.value.size
+        val startedAt = System.currentTimeMillis()
+        if (!workspaceTasks.runCommand(root, label, commandLine, kind, root)) {
+            return "✗ 已有构建/运行任务正在执行（终端忙）。请先在任务中心点「停止」，再重试。"
+        }
+        var timedOut = false
+        var stalled = false
+        var idleLimitUsedMs = 0L
+        try {
+            // 等它真的进入运行态（正常几十毫秒；准备阶段立刻失败会直接落到结束态）。
+            withTimeoutOrNull(30_000) { workspaceTasks.state.first { it.running } }
+            // ★ 卡死看门狗（用户报告「构建失败也不会停止」的正面修复）：
+            //   原来只等 `!running`。但 guest 里的 Gradle 被 OOM 杀掉后 pty 不再回 EOF、
+            //   状态就永远停在 running —— 界面永远「执行中…」，AI 那轮也永远不返回。
+            //   现在除总超时外还盯「输出是否还在增长」：连续一段时间零新输出即判定卡死并终止。
+            val deadline = System.currentTimeMillis() + timeoutMs
+            val idleLimitMs = minOf(300_000L, (timeoutMs / 3).coerceAtLeast(60_000L))
+            idleLimitUsedMs = idleLimitMs
+            var lastOutputSize = workspaceTasks.output.value.size
+            var lastActiveAt = System.currentTimeMillis()
+            while (workspaceTasks.state.value.running) {
+                val now = System.currentTimeMillis()
+                if (now >= deadline) { timedOut = true; break }
+                val size = workspaceTasks.output.value.size
+                if (size != lastOutputSize) {
+                    lastOutputSize = size
+                    lastActiveAt = now
+                } else if (now - lastActiveAt >= idleLimitMs) {
+                    stalled = true
+                    break
+                }
+                kotlinx.coroutines.delay(500)
+            }
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            // 用户点了「停止生成」/协程被取消：必须把 guest 里的进程一起收掉。
+            runCatching { workspaceTasks.stop() }
+            throw ce
+        }
+        if (timedOut || stalled) {
+            workspaceTasks.stop()
+            withTimeoutOrNull(15_000) { workspaceTasks.state.first { !it.running } }
+        }
+        val st = workspaceTasks.state.value
+        val tail = workspaceTasks.output.value.drop(before).joinToString("\n")
+        val elapsed = if (st.durationMs > 0) st.durationMs else System.currentTimeMillis() - startedAt
+        return buildString {
+            append(
+                when {
+                    stalled -> "✗ 构建卡死已终止（长时间无输出）"
+                    timedOut -> "✗ 构建超时已终止"
+                    st.success == true -> "✓ 构建成功"
+                    st.cancelled -> "✗ 构建已停止"
+                    else -> "✗ 构建失败"
+                }
+            )
+            append("：").append(root.name).append(" · ").append(label)
+            append(" · 用时 ").append(readableDuration(elapsed))
+            st.exitCode?.let { append(" · 退出码 ").append(it) }
+            append('\n')
+            if (timedOut) {
+                append("达到超时上限 ${timeoutMs / 1000}s，已请求停止构建进程（任务中心可见状态）。\n")
+            }
+            if (stalled) {
+                append("超过 ${idleLimitUsedMs / 1000}s 无任何新输出，已判定卡死并终止构建进程。\n")
+                append("常见原因：依赖下载卡住 / 等文件锁 / guest 进程被 OOM 杀掉（状态不再更新）。\n")
+            }
+            append("---- 构建日志（尾部）----\n")
+            append(tail.takeLast(8000))
+            if (st.success != true) {
+                append("\n提示：优先定位日志里的 error: 行；若报的是环境/工具链缺失，先用 toolchain_status 自检或 install_env 补齐。")
+            }
+        }
+    }
+
+    /** 人类可读耗时（构建回执与任务卡片共用同一套写法）。 */
+    private fun readableDuration(ms: Long): String {
+        val s = (ms / 1000).coerceAtLeast(0)
+        return when {
+            s < 60 -> "${s}s"
+            s < 3600 -> "${s / 60}m${s % 60}s"
+            else -> "${s / 3600}h${(s % 3600) / 60}m"
+        }
+    }
+
+    /** 构建并运行/安装到设备（仅 Android/Gradle 支持一键「构建 → 安装 → 启动」）。 */
+    override suspend fun runProject(projectPath: String, timeoutMs: Long): String = withContext(Dispatchers.IO) {
+        val root = File(projectPath)
+        if (!root.isDirectory) return@withContext "✗ 项目目录不存在：$projectPath"
+        val kind = detectBuildKind(root)
+        if (kind != "gradle") {
+            return@withContext buildString {
+                append("✗ run_app 目前只支持 Android/Gradle 项目的一键构建安装。\n")
+                append("当前项目：").append(root.name).append("（类型 ").append(kind).append("）。\n")
+                append("可以先用 build_project 产出安装包。")
+            }
+        }
+        val controller = com.nebulaforge.core.session.RealAndroidBuildRunController(this@NebulaForgeApplication)
+        val summary = StringBuilder()
+        var failed = false
+        var lastSessionId: String? = null
+        val startedAt = System.currentTimeMillis()
+
+        // 超时/被停止时**必须**取消底层会话：否则设备上 Gradle 与 adb 会继续跑，
+        // 用户看到的现象正是「超时报错了，但进程还在跑、也停不下来」。
+        fun abortWithCancel(reason: String) {
+            val id = lastSessionId
+            val cancelled = if (id == null) false else runCatching {
+                controller.cancelBuild(id) || controller.cancelRun(id)
+            }.getOrDefault(false)
+            summary.appendLine(reason + if (cancelled) "（已取消底层会话）" else "（无活动会话可取消）")
+        }
+
+        try {
+            withTimeout(timeoutMs) {
+                controller.buildAndRun(root).collect { event ->
+                    when (event) {
+                        is com.nebulaforge.core.session.IdeEvent.State -> {
+                            lastSessionId = event.sessionId
+                            val st = event.state
+                            if (st is com.nebulaforge.core.session.SessionState.Failed) {
+                                failed = true
+                                summary.appendLine("失败：" + st.message)
+                            } else if (st is com.nebulaforge.core.session.SessionState.Succeeded) {
+                                summary.appendLine("成功：" + st.message)
+                            } else if (st is com.nebulaforge.core.session.SessionState.Running) {
+                                summary.appendLine("进行中：" + st.message)
+                            }
+                        }
+                        is com.nebulaforge.core.session.IdeEvent.Artifact ->
+                            summary.appendLine("产物：" + event.path)
+                        is com.nebulaforge.core.session.IdeEvent.Device ->
+                            summary.appendLine("设备：" + event.serial + " " + event.state)
+                        is com.nebulaforge.core.session.IdeEvent.Output ->
+                            if (summary.length < 40_000) summary.appendLine(event.text)
+                        else -> {}
+                    }
+                }
+            }
+        } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
+            failed = true
+            abortWithCancel("运行流程超时（${timeoutMs / 1000}s）")
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            abortWithCancel("运行流程被用户停止")
+            throw ce
+        } catch (t: Throwable) {
+            failed = true
+            abortWithCancel("异常：" + (t.message ?: t.javaClass.simpleName))
+        }
+        val elapsed = System.currentTimeMillis() - startedAt
+        buildString {
+            append(if (failed) "✗ 构建运行失败" else "✓ 已构建并下发运行")
+            append("：").append(root.name)
+            append(" · 用时 ").append(readableDuration(elapsed))
+            append('\n')
+            append("---- 过程摘要 ----\n").append(summary.toString().takeLast(6000))
+            append("\n提示：要看运行时日志用 capture_logcat；设备未连上时先确认 Shizuku / ADB 通道。")
+        }
+    }
+
+    /** 构建环境自检：编译失败时先确认环境，而不是改代码。 */
+    override fun toolchainStatus(verbose: Boolean): String = runBlocking {
+        val ctx = this@NebulaForgeApplication
+        val envApi = com.nebulaforge.core.environment.Environment
+        val sb = StringBuilder()
+        sb.append("构建环境自检（项目工具链用户态）\n")
+        sb.append("· shell 通道: ").append(envApi.resolveShell(ctx)).append('\n')
+        sb.append("· JDK 17: ").append(envApi.resolveJdkHome(ctx, 17) ?: "未安装 —— Gradle 构建必需").append('\n')
+        sb.append("· JDK 已装版本: ").append(
+            runCatching { envApi.listInstalledJdkVersions(ctx).joinToString(", ") { it.majorVersion.toString() } }.getOrDefault("未知")
+        ).append('\n')
+        sb.append("· Android SDK: ").append(if (envApi.isAndroidSdkReady(ctx)) "就绪（${envApi.androidSdkRoot(ctx)}）" else "缺失（${envApi.androidSdkRoot(ctx)}）").append('\n')
+        sb.append("· Gradle: ").append(envApi.resolveGradle(ctx)?.absolutePath ?: "未安装").append('\n')
+        sb.append("· 当前项目: ").append(currentProjectPath() ?: "（无）").append('\n')
+        sb.append("---- 命令行实测 ----\n")
+        sb.append(
+            execInToolchain(
+                "for c in java javac gradle node npm flutter dart go python3; do printf '%-8s ' \"\$c\"; command -v \"\$c\" || echo '未安装'; done",
+                currentProjectPath(), 25_000
+            )
+        ).append('\n')
+        sb.append("可用模板（create_project）: ")
+            .append(com.nebulaforge.core.projectmodel.ProjectTemplateGenerator.templates.joinToString(", ") { it.id })
+            .append('\n')
+        if (verbose) {
+            sb.append("---- 关键环境变量 ----\n")
+            toolchainEnv().entries.sortedBy { it.key }.forEach { (k, v) ->
+                if (v.isNotBlank()) sb.append("  ").append(k).append('=').append(v).append('\n')
+            }
+        }
+        sb.toString()
+    }
+
+    /** 新建项目：复用「新建项目向导」的模板脚手架，建完切换当前工作区。 */
+    override suspend fun createProject(name: String, template: String?, packageName: String?): String =
+        withContext(Dispatchers.IO) {
+            val projectName = name.trim()
+            if (projectName.isEmpty()) return@withContext "✗ 项目名不能为空"
+            if (!Regex("^[A-Za-z0-9_.-]+$").matches(projectName)) {
+                return@withContext "✗ 项目名只能用字母、数字、下划线、点和连字符：$projectName"
+            }
+            val gen = com.nebulaforge.core.projectmodel.ProjectTemplateGenerator
+            val tpl = template?.trim()?.takeIf { it.isNotBlank() }?.let { gen.find(it) }
+                ?: gen.find("android-empty")
+                ?: gen.templates.firstOrNull()
+                ?: return@withContext "✗ 模板库为空，无法新建项目"
+            val projectsRoot = File(com.nebulaforge.core.environment.Environment.projectsDir(this@NebulaForgeApplication))
+            projectsRoot.mkdirs()
+            val target = File(projectsRoot, projectName)
+            if (target.exists() && !target.listFiles().isNullOrEmpty()) {
+                return@withContext "✗ 目标目录已存在且非空：${target.absolutePath}（请换一个项目名）"
+            }
+            val pkg = packageName?.trim()?.takeIf { it.isNotBlank() }
+                ?: "com.example." + projectName.lowercase().replace(Regex("[^a-z0-9]"), "")
+            runCatching { gen.create(tpl.id, target, pkg) }.fold(
+                onSuccess = { dir ->
+                    runCatching { workspaceState.selectProject(dir.absolutePath) }
+                    "✓ 项目已创建：${dir.absolutePath}\n模板=${tpl.id}  包名=$pkg\n" +
+                        "下一步：write_file 写代码 → build_project 编译。"
+                },
+                onFailure = { "✗ 创建项目失败：" + (it.message ?: it.javaClass.simpleName) }
+            )
+        }
+
+    // ------------------------------------------- AI 工具台：新增能力实现（计划闸门 / 提问 / HTTP / 技能）
+
+    /** AI 提问通道：ask_user 工具在此挂起，等用户在工作台作答后再恢复。 */
+    val askBroker = com.nebulaforge.app.ai.AskBroker()
+
+    /**
+     * 本轮任务是否已立计划。
+     *
+     * 用户要求「AI 完成任务前必须先制定计划」，[com.nebulaforge.app.ai.AiTaskToolHost] 用它做代码级闸门：
+     * 没有计划时直接拒绝写类/执行类工具，逼模型先调用 propose_plan（提示词约定之外的第二道保险）。
+     */
+    override fun hasActivePlan(): Boolean = _agentPlanState.value.plan?.steps?.isNotEmpty() == true
+
+    // ---------------------------------------------------------------- 计划登记（「动手前先立计划」的落地点）
+
+    /** 最近一条用户消息：自动兜底计划拿它当 userRequest，任务面板顶部会显示。 */
+    private fun lastUserRequest(): String =
+        _chatState.value.messages.lastOrNull { it.role == AiMessageRole.USER }?.text?.trim().orEmpty()
+
+    override fun registerPlan(summary: String, steps: List<String>): Int {
+        val titles = steps.map { it.trim() }.filter { it.isNotEmpty() }.take(20)
+        if (titles.isEmpty()) return 0
+        val now = System.currentTimeMillis()
+        val plan = AgentPlan(
+            userRequest = lastUserRequest().take(300).ifBlank { summary.ifBlank { "AI 任务" } },
+            summary = summary.ifBlank { "执行计划" },
+            steps = titles.mapIndexed { i, t -> planStep(i + 1, t, AgentPlanStepStatus.PENDING) },
+            createdAt = now,
+            startedAt = now,
+            status = AgentPlanStatus.EXECUTING
+        )
+        autoPlanId = null // 模型自己的计划接管，工作台不再往里追加步骤
+        _agentPlanState.value = AgentPlanUiState(plan = plan)
+        runCatching { agentPlanStore.save(plan) }
+        return plan.steps.size
+    }
+
+    override fun ensureAutoPlan(operation: String): Boolean {
+        val op = operation.trim().ifEmpty { "执行当前请求" }
+        val current = _agentPlanState.value.plan
+        if (current != null && current.id == autoPlanId) {
+            // 同一份自动计划内继续追加：把走过的步骤标记完成、新步骤标为进行中，
+            // 任务面板便会随 AI 动手自然显示成「N/M」，而不是一直停在第 1 步。
+            val done = current.steps.map { it.copy(status = AgentPlanStepStatus.COMPLETED) }
+            val updated = current.copy(steps = done + planStep(done.size + 1, op, AgentPlanStepStatus.RUNNING))
+            _agentPlanState.value = _agentPlanState.value.copy(plan = updated)
+            runCatching { agentPlanStore.save(updated) }
+            return true
+        }
+        val now = System.currentTimeMillis()
+        val plan = AgentPlan(
+            userRequest = lastUserRequest().take(300).ifBlank { op },
+            summary = "AI 执行计划（工作台自动登记）",
+            steps = listOf(planStep(1, op, AgentPlanStepStatus.RUNNING)),
+            createdAt = now,
+            startedAt = now,
+            status = AgentPlanStatus.EXECUTING
+        )
+        autoPlanId = plan.id
+        _agentPlanState.value = AgentPlanUiState(plan = plan)
+        runCatching { agentPlanStore.save(plan) }
+        return true
+    }
+
+    /** 构造计划步骤：标题取前 60 字；动作类型按关键词猜，仅用于展示，不参与权限判定。 */
+    private fun planStep(index: Int, text: String, status: AgentPlanStepStatus): AgentPlanStep {
+        val clean = text.replace('\n', ' ').trim().take(160)
+        return AgentPlanStep(
+            id = "step-$index",
+            title = clean.take(60).ifBlank { "步骤 $index" },
+            description = clean,
+            action = planActionFor(clean),
+            requiresApproval = false,
+            status = status
+        )
+    }
+
+    private fun planActionFor(text: String): AgentPlanAction {
+        val t = text.lowercase()
+        return when {
+            t.contains("构建") || t.contains("编译") || t.contains("build") -> AgentPlanAction.BUILD
+            t.contains("运行") || t.contains("安装依赖") || t.contains("install") -> AgentPlanAction.RUN
+            t.contains("执行命令") || t.contains("命令") || t.contains("shell") -> AgentPlanAction.EXECUTE_COMMAND
+            t.contains("apk") -> AgentPlanAction.INSPECT_APK
+            t.contains("接口") || t.contains("api") -> AgentPlanAction.INSPECT_API
+            t.contains("网页") || t.contains("web") || t.contains("请求") -> AgentPlanAction.INSPECT_WEB
+            t.contains("搜索") || t.contains("联网") -> AgentPlanAction.SEARCH_WEB
+            t.contains("验证") -> AgentPlanAction.VERIFY_RESULT
+            t.contains("读取") || t.contains("分析") -> AgentPlanAction.ANALYZE_PROJECT
+            else -> AgentPlanAction.PROPOSE_MODIFICATION
+        }
+    }
+
+    /** 任务正常收工：把计划标记为完成，任务面板显示终态（例如 6/6）。 */
+    private fun completeActivePlan() {
+        val plan = _agentPlanState.value.plan ?: return
+        if (plan.status == AgentPlanStatus.COMPLETED) return
+        val done = plan.copy(
+            status = AgentPlanStatus.COMPLETED,
+            completedAt = System.currentTimeMillis(),
+            steps = plan.steps.map { it.copy(status = AgentPlanStepStatus.COMPLETED) }
+        )
+        _agentPlanState.value = _agentPlanState.value.copy(plan = done)
+        runCatching { agentPlanStore.save(done) }
+    }
+
+    override suspend fun askUser(question: String, options: List<String>): String = askBroker.ask(question, options)
+
+    /** 解析「A: 1; B: 2」或换行分隔的请求头文本。 */
+    private fun parseHeaderLines(raw: String?): List<Pair<String, String>> {
+        if (raw.isNullOrBlank()) return emptyList()
+        return raw.trim().replace("\r\n", "\n").replace(';', '\n')
+            .split('\n').map { it.trim() }.filter { it.contains(':') }
+            .mapNotNull { line ->
+                val name = line.substringBefore(':').trim()
+                val value = line.substringAfter(':').trim()
+                if (name.isEmpty() || value.isEmpty()) null else name to value
+            }
+    }
+
+    /** 真实 HTTP 请求（接口联调 / 取数据）。 */
+    override suspend fun httpRequest(method: String, url: String, headers: String?, body: String?): String =
+        withContext(Dispatchers.IO) {
+            val connection = runCatching { java.net.URL(url).openConnection() as java.net.HttpURLConnection }
+                .getOrElse { return@withContext "✗ URL 无法解析：$url（${it.message ?: it.javaClass.simpleName}）" }
+            try {
+                connection.requestMethod = method.uppercase()
+                connection.connectTimeout = 20_000
+                connection.readTimeout = 40_000
+                connection.instanceFollowRedirects = true
+                connection.setRequestProperty("User-Agent", "NebulaForgeIDE/1.0")
+                parseHeaderLines(headers).forEach { (name, value) -> connection.setRequestProperty(name, value) }
+                if (!body.isNullOrBlank() && method.uppercase() != "GET") {
+                    connection.doOutput = true
+                    connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+                }
+                val code = connection.responseCode
+                val text = runCatching {
+                    val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+                    stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                }.getOrNull().orEmpty()
+                buildString {
+                    append("HTTP ").append(code).append(' ').append(connection.responseMessage ?: "").append('\n')
+                    connection.headerFields.orEmpty().forEach { (name, values) ->
+                        if (name != null && values != null) {
+                            append(name).append(": ").append(values.joinToString(", ")).append('\n')
+                        }
+                    }
+                    append('\n').append(text.take(20_000))
+                    if (text.length > 20_000) {
+                        append("\n…（正文过长已截断，共 ").append(text.length).append(" 字符）")
+                    }
+                }
+            } catch (error: Exception) {
+                "✗ 请求失败：${error.message ?: error.javaClass.simpleName}"
+            } finally {
+                runCatching { connection.disconnect() }
+            }
+        }
+
+    /** 列出技能与妙招（动手前先看有没有可复用的，避免重复造）。 */
+    override fun describeSkills(kind: String): String {
+        val normalized = kind.trim().lowercase()
+        val wantTricks = normalized.isEmpty() || normalized == "all" || normalized.startsWith("trick")
+        val wantSkills = normalized.isEmpty() || normalized == "all" || normalized.startsWith("skill")
+        return buildString {
+            if (wantTricks) {
+                val tricks = runCatching { capabilities.tricks.list() }.getOrDefault(emptyList())
+                append("## 妙招（").append(tricks.size).append(" 个；启用后作为提示词补丁生效）\n")
+                if (tricks.isEmpty()) append("（暂无妙招）\n")
+                tricks.forEach { trick ->
+                    append("- ").append(trick.name).append("  id=").append(trick.id)
+                        .append(if (trick.enabled) "  [已启用]" else "  [未启用]").append('\n')
+                    if (trick.summary.isNotBlank()) append("  ").append(trick.summary).append('\n')
+                }
+            }
+            if (wantSkills) {
+                if (wantTricks) append('\n')
+                val skills = runCatching { capabilities.skills.list() }.getOrDefault(emptyList())
+                append("## 技能（").append(skills.size).append(" 个；[可运行] 表示带入口脚本）\n")
+                if (skills.isEmpty()) append("（暂无技能）\n")
+                skills.forEach { skill ->
+                    append("- ").append(skill.name).append("  id=").append(skill.id)
+                        .append(if (skill.hasEntry) "  [可运行]" else "  [说明型]").append('\n')
+                    if (skill.description.isNotBlank()) append("  ").append(skill.description).append('\n')
+                }
+            }
+            append("\n可复用的直接用 run_skill 执行；确需新增再用 create_skill / create_trick。")
+        }
+    }
+
+    /** 删除技能或妙招（id 或名称皆可）。 */
+    override fun removeSkill(kind: String, id: String): String {
+        if (kind.trim().lowercase().startsWith("trick")) {
+            val trick = capabilities.tricks.list().firstOrNull { it.id == id || it.name == id }
+                ?: return "✗ 没找到妙招：$id（先用 list_skills 确认 id）"
+            capabilities.tricks.delete(trick.id)
+            refreshWorkbenchPanels()
+            return "✓ 已删除妙招「${trick.name}」"
+        }
+        val skill = capabilities.skills.list().firstOrNull { it.id == id || it.name == id }
+            ?: return "✗ 没找到技能：$id（先用 list_skills 确认 id）"
+        capabilities.skills.delete(skill.id)
+        refreshWorkbenchPanels()
+        return "✓ 已删除技能「${skill.name}」"
+    }
+
+    // ------------------------------------------- AI 工具台：逆向能力实现（APK / Web / API）
+
+    /** APK 逆向引擎（与逆向工作台同源实现，AI 与界面看到的结果一致）。 */
+    private val apkReverseEngine by lazy { com.nebulaforge.app.reverse.ApkReverseEngine(this) }
+
+    /** MITM 动态证书颁发机构。 */
+    private val reverseCertificateAuthority by lazy {
+        com.nebulaforge.app.reverse.api.CertificateAuthority(this)
+    }
+
+    /**
+     * 供 AI 与「API 逆向」界面共用的 MITM 代理。
+     *
+     * 两边必须用**同一个实例**：代理底层是绑定 127.0.0.1 的 ServerSocket，界面再 new 一个
+     * 就会端口冲突（`start()` 幂等，但两个实例各自持有一份 ServerSocket，第二次 start 会
+     * 直接抛 BindException，表现为「点启动代理没反应/闪退」）。这里统一暴露同一份实例，
+     * 并且两边共用同一份接口仓库（reverseEvidence.apiRegistry），抓到的接口天然共享。
+     */
+    private val reverseProxy by lazy {
+        com.nebulaforge.app.reverse.api.MitmProxyServer(
+            reverseCertificateAuthority, reverseEvidence.apiRegistry
+        ) { }
+    }
+
+    /** 逆向功能共用的 CA（证书只生成一份，避免界面/Agent 出现两张互不相同的 CA）。 */
+    val reverseCa: com.nebulaforge.app.reverse.api.CertificateAuthority
+        get() = reverseCertificateAuthority
+
+    /** 逆向功能共用的 MITM 代理实例。 */
+    val mitmProxy: com.nebulaforge.app.reverse.api.MitmProxyServer
+        get() = reverseProxy
+
+    private fun renderReverseEvent(event: com.nebulaforge.app.reverse.ApkReverseEngine.Event): String =
+        when (event) {
+            is com.nebulaforge.app.reverse.ApkReverseEngine.Event.Output -> event.text + "\n"
+            is com.nebulaforge.app.reverse.ApkReverseEngine.Event.Finished -> "退出码=${event.exitCode}\n"
+            else -> ""
+        }
+
+    /** 把 APK 静态分析结果渲染成结构化文本（AI 直接读，不用再猜字段）。 */
+    private fun renderApkReport(report: com.nebulaforge.app.reverse.ApkReverseEngine.ApkReport): String =
+        buildString {
+            val m = report.manifestSummary
+            append("APK：").append(File(report.apkPath).name).append('\n')
+            append("规模：").append(report.size / 1024).append(" KB，DEX ").append(report.dexCount)
+            append(" 个，压缩条目 ").append(report.entries.size).append('\n')
+            append("SHA256：").append(report.sha256.take(32)).append("…\n")
+            append("包名：").append(m.packageName ?: "未解析")
+            append("  版本：").append(m.versionName ?: "-").append("（").append(m.versionCode ?: "-").append("）\n")
+            if (m.usesSdk.isNotEmpty()) append("SDK：").append(m.usesSdk.joinToString(", ")).append('\n')
+
+            fun section(title: String, items: List<String>, limit: Int = 25) {
+                if (items.isEmpty()) return
+                append('\n').append(title).append("（").append(items.size).append("）：\n")
+                items.take(limit).forEach { append("  - ").append(it).append('\n') }
+                if (items.size > limit) append("  … 其余 ").append(items.size - limit).append(" 项\n")
+            }
+            section("权限", m.permissions)
+            section("Activity", m.activities, 15)
+            section("Service", m.services, 15)
+            section("Receiver", m.receivers, 15)
+            section("Provider", m.providers, 15)
+            section("Native 库", report.nativeLibraries)
+            section("内置 URL / 网络线索", report.urls, 30)
+            section("Assets", report.assets, 15)
+            if (report.signingCertificates.isNotEmpty()) {
+                append("\n签名证书（").append(report.signingCertificates.size).append("）：\n")
+                report.signingCertificates.take(5).forEach { append("  - ").append(it).append('\n') }
+            }
+            append("\n下一步：unpack 反编译看 smali/资源 → read/write 改 → rebuild 回编签名。")
+        }
+
+    override suspend fun reverseApk(
+        action: String, path: String?, file: String?, content: String?, out: String?
+    ): String = withContext(Dispatchers.IO) {
+        runCatching {
+            when (action) {
+                "inspect" -> {
+                    val apk = File(path.orEmpty())
+                    if (!apk.isFile) return@runCatching "✗ APK 不存在：${apk.absolutePath}"
+                    val text = renderApkReport(apkReverseEngine.inspect(apk))
+                    reverseEvidence.setApkEvidence(apk.absolutePath, text)
+                    text
+                }
+                "unpack" -> {
+                    val apk = File(path.orEmpty())
+                    if (!apk.isFile) return@runCatching "✗ APK 不存在：${apk.absolutePath}"
+                    val workspace = apkReverseEngine.workspaceFor(apk)
+                    val log = StringBuilder()
+                    apkReverseEngine.decompileResources(apk).collect { log.append(renderReverseEvent(it)) }
+                    apkReverseEngine.generateJava(apk).collect { log.append(renderReverseEvent(it)) }
+                    reverseEvidence.setApkEvidence(apk.absolutePath, renderApkReport(apkReverseEngine.inspect(apk)))
+                    buildString {
+                        append("✓ 反编译完成\n")
+                        append("工作区：").append(workspace.absolutePath).append('\n')
+                        append("下一步：apk_reverse(action=files, path=工作区) 看可改文件。\n\n")
+                        append("日志（尾部）：\n").append(log.toString().takeLast(3000))
+                    }
+                }
+                "files" -> {
+                    val dir = File(path.orEmpty())
+                    if (!dir.isDirectory) return@runCatching "✗ 反编译工作区不存在：${dir.absolutePath}（先执行 unpack）"
+                    val files = apkReverseEngine.listEditableFiles(dir)
+                    if (files.isEmpty()) "（工作区内暂无可编辑文件）"
+                    else buildString {
+                        append("可编辑文件 ").append(files.size).append(" 个（相对工作区路径）：\n")
+                        files.take(200).forEach { append("  ").append(runCatching { it.relativeTo(dir).path }.getOrDefault(it.name)).append('\n') }
+                        append("\n用 read 读取、write 修改（原文件自动备份），最后 rebuild 回编。")
+                    }
+                }
+                "read" -> {
+                    val dir = File(path.orEmpty())
+                    val target = File(dir, file.orEmpty())
+                    apkReverseEngine.readEditableFile(dir, target).take(30_000)
+                }
+                "write" -> {
+                    val dir = File(path.orEmpty())
+                    val target = File(dir, file.orEmpty())
+                    apkReverseEngine.writeEditableFile(dir, target, content.orEmpty())
+                    "✓ 已写入 ${runCatching { target.relativeTo(dir).path }.getOrDefault(target.name)}（原文件已备份）"
+                }
+                "rebuild" -> {
+                    val dir = File(path.orEmpty())
+                    if (!dir.isDirectory) return@runCatching "✗ 工作区不存在：${dir.absolutePath}"
+                    val output = out?.takeIf { it.isNotBlank() }?.let { File(it) }
+                        ?: File(dir.parentFile ?: dir, dir.name + "-signed.apk")
+                    val log = StringBuilder()
+                    apkReverseEngine.rebuildAndSign(dir, output).collect { log.append(renderReverseEvent(it)) }
+                    buildString {
+                        append("✓ 回编完成：").append(output.absolutePath).append('\n')
+                        append("（若为自签名，安装前需先卸载原应用）\n\n日志（尾部）：\n")
+                        append(log.toString().takeLast(2500))
+                    }
+                }
+                "evidence" -> {
+                    val snapshot = reverseEvidence.snapshot()
+                    buildString {
+                        append("最近一次逆向证据：\n")
+                        append("- APK：").append(snapshot.apkPath ?: "（无）").append('\n')
+                        append("- Web 抓包记录：").append(snapshot.webCount).append(" 条\n")
+                        append("- API 接口：").append(snapshot.apiCount).append(" 个\n")
+                        snapshot.apkReport?.let { append('\n').append(it.take(4000)) }
+                    }
+                }
+                "toolchain" -> renderReverseToolchainStatus()
+                else -> "✗ 未知 action：$action"
+            }
+        }.getOrElse { "✗ 逆向操作异常：${it.message ?: it.javaClass.simpleName}" }
+    }
+
+    /** Web 逆向：看内置浏览器抓到的网络记录，并可交给 AI 分析。 */
+    override suspend fun reverseWeb(action: String, url: String?, limit: Int): String {
+        val all = reverseEvidence.webRecorder.records.value
+        val filtered = all.filter { url == null || it.url.contains(url, ignoreCase = true) }.takeLast(limit)
+        return when (action) {
+            "records" -> {
+                if (filtered.isEmpty()) {
+                    "（没有匹配的捕获记录，共 ${all.size} 条）—— 先用内置浏览器打开目标页面，再回来分析。"
+                } else buildString {
+                    append("Web 捕获记录 ").append(filtered.size).append(" 条（总计 ").append(all.size).append("）：\n")
+                    filtered.forEach { record ->
+                        append("- [").append(record.kind).append("] ").append(record.method).append(' ')
+                            .append(record.url.take(180))
+                        record.statusCode?.let { append("  → ").append(it) }
+                        append("  ").append(record.responseBytes).append("B")
+                        if (!record.responseCaptured) append("（未抓到正文）")
+                        append('\n')
+                        record.responsePreview?.takeIf { it.isNotBlank() }?.let { preview ->
+                            append("    ").append(preview.take(200).replace('\n', ' ')).append('\n')
+                        }
+                    }
+                }
+            }
+            "analyze" -> if (filtered.isEmpty()) {
+                "✗ 没有可分析的记录：先在内置浏览器访问目标页面。"
+            } else {
+                com.nebulaforge.app.reverse.ai.ReverseAiAssistant(agentStepCompletionClient()).analyzeWeb(filtered)
+            }
+            "clear" -> {
+                reverseEvidence.webRecorder.clear()
+                "✓ 已清空 Web 捕获记录"
+            }
+            "to_api" -> {
+                // Web 证据 → API 端点库：浏览页面时抓到的接口直接沉淀成端点，不用手工把 URL 抄到 API 页。
+                // 界面按钮、AI 工具、MCP 工具共用 ReverseBridge 这一份实现，保证口径一致。
+                val merged = com.nebulaforge.app.reverse.ReverseBridge
+                    .mergeWebRecordsIntoApi(filtered, reverseEvidence.apiRegistry, null)
+                if (merged == 0) {
+                    "✗ 没有可并入的记录（静态资源不计入接口）。先用内置浏览器访问目标页面。"
+                } else {
+                    buildString {
+                        append("✓ 已并入 ").append(merged).append(" 条接口到 API 端点库")
+                        append("（当前共 ").append(reverseEvidence.apiRegistry.all().size).append(" 个）\n")
+                        append("下一步：api_reverse(action=openapi) 导出 OpenAPI，或 action=endpoints 看清单。")
+                    }
+                }
+            }
+            else -> "✗ 未知 action：$action（可用 records/analyze/to_api/clear）"
+        }
+    }
+
+    /** API 逆向：接口清单 / AI 分析 / OpenAPI 导出 / MITM 代理开关。 */
+    override suspend fun reverseApi(action: String, filter: String?, port: Int?): String {
+        val registry = reverseEvidence.apiRegistry
+        val all = registry.all()
+        val filtered = all.filter {
+            filter == null || it.url.contains(filter, ignoreCase = true) ||
+                it.normalizedUrl.contains(filter, ignoreCase = true)
+        }
+        return when (action) {
+            "endpoints" -> if (filtered.isEmpty()) {
+                "（暂无接口，总计 ${all.size} 个）可用 proxy_start 起 MITM 代理抓真机流量，" +
+                    "或在内置浏览器里访问后自动记录。"
+            } else buildString {
+                append("接口 ").append(filtered.size).append(" 个（总计 ").append(all.size).append("）：\n")
+                filtered.take(120).forEach { endpoint ->
+                    append("- ").append(endpoint.method.uppercase()).append(' ').append(endpoint.normalizedUrl)
+                    if (endpoint.status > 0) append("  → ").append(endpoint.status)
+                    append('\n')
+                    endpoint.mimeType?.let { append("    ").append(it).append('\n') }
+                    endpoint.responsePreview?.takeIf { it.isNotBlank() }?.let { preview ->
+                        append("    ").append(preview.take(160).replace('\n', ' ')).append('\n')
+                    }
+                }
+            }
+            "analyze" -> if (filtered.isEmpty()) {
+                "✗ 没有可分析的接口。"
+            } else {
+                com.nebulaforge.app.reverse.ai.ReverseAiAssistant(agentStepCompletionClient()).analyzeApi(filtered)
+            }
+            "openapi" -> registry.toOpenApi()
+            "proxy_start" -> {
+                if (reverseProxy.isRunning()) {
+                    "代理已在运行：127.0.0.1:${reverseProxy.port()}"
+                } else {
+                    val bound = reverseProxy.start(port ?: 0)
+                    buildString {
+                        append("✓ MITM 代理已启动：127.0.0.1:").append(bound).append('\n')
+                        append("1) 手机 Wi-Fi → 代理 → 手动 → 主机 127.0.0.1，端口 ").append(bound).append('\n')
+                        append("2) 安装 CA 证书：")
+                            .append(reverseCertificateAuthority.certificateFile().absolutePath).append('\n')
+                        append("3) 让 App 发起请求，然后用 api_reverse(action=endpoints) 查看接口。\n")
+                        append("停止：api_reverse(action=proxy_stop)。")
+                    }
+                }
+            }
+            "proxy_stop" -> {
+                reverseProxy.stop()
+                "✓ MITM 代理已停止"
+            }
+            "proxy_status" -> if (reverseProxy.isRunning()) {
+                "运行中：127.0.0.1:${reverseProxy.port()}"
+            } else {
+                "未运行（用 proxy_start 启动）"
+            }
+            "clear" -> {
+                registry.clear()
+                "✓ 已清空接口记录"
+            }
+            else -> "✗ 未知 action：$action"
+        }
+    }
+
+    /**
+     * 本机 MITM CA 证书能力出口（AI 工具 `ca_certificate` 与 MCP 工具 `reverse_ca` 共用）。
+     *
+     * 抓 HTTPS 的真正门槛在证书，而不在代理：Android 7+ 起「用户证书」不被任何 App（含 WebView）
+     * 信任，只有写进**系统**证书库才通吃。这里把 status / export / install_system / install_user
+     * 四件事收敛成一个动作，让 Agent 能替用户走完这段流程，而不是丢一句「请自行安装证书」。
+     */
+    override suspend fun caCertificate(action: String): String = withContext(Dispatchers.IO) {
+        val ca = reverseCertificateAuthority
+        runCatching {
+            when (action.lowercase()) {
+                "status" -> buildString {
+                    val hash = runCatching { ca.subjectHash(this@NebulaForgeApplication) }
+                        .getOrDefault("(未生成)")
+                    val installed = com.nebulaforge.app.reverse.api.SystemCaInstaller
+                        .isInstalled(this@NebulaForgeApplication, ca)
+                    append("本机 CA：").append(com.nebulaforge.app.reverse.api.CertificateAuthority.CA_COMMON_NAME).append('\n')
+                    append("证书文件：").append(ca.certificateFile().absolutePath).append('\n')
+                    append("subject_hash：").append(hash).append("（系统库里的文件名是 ").append(hash).append(".0）\n")
+                    append("系统证书库：").append(if (installed) "✓ 已安装（其它 App 也会信任）" else "✗ 未安装（只有本应用信任）").append('\n')
+                    append("代理：")
+                        .append(if (reverseProxy.isRunning()) "运行中 127.0.0.1:${reverseProxy.port()}" else "未运行")
+                        .append('\n')
+                    append("关键事实：只有「系统证书库」对其它 App 生效；用户证书在 Android 7+ 默认不被信任。")
+                }
+                "export" -> {
+                    val exported = ca.exportToPublic(this@NebulaForgeApplication)
+                    if (exported != null) {
+                        "✓ 已导出 CA：${exported.absolutePath}\n" +
+                            "可手动安装，或直接 ca_certificate(action=install_system) 写入系统证书库（需 Root/Shizuku）。"
+                    } else {
+                        "✗ 导出失败：公共目录不可写（未授予存储权限时会这样）"
+                    }
+                }
+                "install_system" -> {
+                    val outcome = com.nebulaforge.app.reverse.api.SystemCaInstaller
+                        .install(this@NebulaForgeApplication, ca)
+                    (if (outcome.success) "✓ " else "✗ ") + outcome.detail
+                }
+                "install_user" -> {
+                    runCatching {
+                        startActivity(
+                            ca.installIntent().addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    }.onFailure { return@withContext "✗ 无法打开系统证书安装界面：${it.message ?: it.javaClass.simpleName}" }
+                    "已打开系统「安装证书」界面：选择「CA 证书」→ 选中导出的 nebulaforge-ca.crt。\n" +
+                        "注意：用户证书在 Android 7+ 只对本应用生效（配合 Web 页「信任本地 MITM 证书」开关）。"
+                }
+                else -> "✗ 未知 action：$action（可用 status/export/install_system/install_user）"
+            }
+        }.getOrElse { "✗ CA 操作异常：${it.message ?: it.javaClass.simpleName}" }
+    }
+
+    /**
+     * 逆向工具链自检（`apk_reverse(action=toolchain)` 与 MCP `reverse_toolchain` 共用）。
+     *
+     * 逆向动作会在中途失败得很难看（反编译到一半发现没有 apktool），所以让 Agent 能在动手前
+     * 先确认四件套是否就绪，并把「缺什么、去哪儿装」一次说清。
+     */
+    private fun renderReverseToolchainStatus(): String {
+        val status = runCatching { apkReverseEngine.toolStatus() }.getOrNull()
+            ?: return "✗ 逆向引擎未就绪"
+        val apktool = status.apktoolJar
+        val jadx = status.jadxJar
+        val apksigner = status.apksigner
+        return buildString {
+            append("逆向工具链自检：\n")
+            append("- JDK：").append(if (status.readyForAnalysis) "✓ 就绪" else "✗ 未就绪（找不到 Java 运行时）").append('\n')
+            append("- apktool：")
+                .append(if (apktool?.isFile == true) "✓ " + apktool.absolutePath else "✗ 未安装（反编译资源/smali 需要）")
+                .append('\n')
+            append("- JADX：")
+                .append(if (jadx?.isFile == true) "✓ " + jadx.absolutePath else "✗ 未安装（生成 Java 源码需要）")
+                .append('\n')
+            append("- apksigner：")
+                .append(if (apksigner?.isFile == true) "✓ " + apksigner.absolutePath else "✗ 未发现（回编签名需要 build-tools）")
+                .append('\n')
+            append("\n缺组件时到「Web 逆向 → APK」页一键安装：Termux 仓库优先，失败自动回退内置/网络下载并显示进度。")
+        }
+    }
+
+    override fun onToolStateChanged() = refreshWorkbenchPanels()
+
+    /**
+     * 刷新工作台侧边面板数据（妙招/技能/记忆/经验）。
+     *
+     * 只在「用户打开面板」「工具改动了数据」「切换项目」时刷新，不做轮询：
+     * 这些数据都在本地文件/SharedPreferences 里，频繁读盘没有意义。
+     */
+    fun refreshWorkbenchPanels() {
+        val project = currentProjectPath()
+        _chatState.value = _chatState.value.copy(
+            tricks = runCatching { capabilities.tricks.list() }.getOrDefault(emptyList()),
+            skills = runCatching { capabilities.skills.list() }.getOrDefault(emptyList()),
+            memories = if (project.isNullOrBlank()) emptyList()
+            else runCatching { capabilities.memories.load(project) }.getOrDefault(emptyList()),
+            experiences = if (project.isNullOrBlank()) emptyList()
+            else runCatching { capabilities.experiences.load(project) }.getOrDefault(emptyList())
+        )
+    }
+
+    /** 恢复上次会话：会话列表 + 消息 + 模型/上下文信息。启动时后台调用，不阻塞冷启动。 */
+    fun restoreChatSession() {
+        runCatching {
+            val metas = chatStore.metas()
+            val settings = com.nebulaforge.core.agent.AiProviderSettingsStore(this).load()
+            val last = metas.firstOrNull()
+            val messages = last?.let { chatStore.messages(it.id) }.orEmpty()
+            _chatState.value = _chatState.value.copy(
+                sessions = metas,
+                activeSessionId = last?.id,
+                messages = messages,
+                contextLimit = settings.contextWindow,
+                maxTokens = settings.maxTokens,
+                modelLabel = "${settings.protocol.label} · ${settings.model}",
+                providerLabel = settings.displayName(),
+                contextTokens = messages.sumOf { estimateTokens(it.text) + estimateTokens(it.reasoning) },
+                online = taskFlags.getBoolean(KEY_ONLINE, true),
+                allowCommand = taskFlags.getBoolean(KEY_ALLOW_COMMAND, true),
+                allowWrite = taskFlags.getBoolean(KEY_ALLOW_WRITE, true)
+            )
+            // 全自动（免审批）：默认 true —— 用户要的是 AI 自己把活干完，而不是逐个弹窗点「允许」。
+            approvalBroker.setAutoAll(taskFlags.getBoolean(KEY_AUTO_APPROVE, true))
+            refreshWorkbenchPanels()
+            refreshShortcuts()
+        }
+    }
+
+    /**
+     * 恢复上次启用过的插件，使「安装 → 启用」在**重启后依然生效**。
+     *
+     * 与 [loadPlugin] 的分工：这里不弹权限、不需要用户重新点「加载」，直接按
+     * [com.nebulaforge.core.plugin.PluginActivationStore] 里持久化的启用状态与已授权限恢复。
+     * 加载失败的插件会被标记为未启用，避免每次冷启动重复失败、反复打扰用户。
+     *
+     * @return 成功恢复的插件数量
+     */
+    fun restoreEnabledPlugins(): Int {
+        val activation = com.nebulaforge.core.plugin.PluginActivationStore(this)
+        var restored = 0
+        com.nebulaforge.app.plugins.PluginMarketplace(this).installed().forEach { descriptor ->
+            if (!activation.isEnabled(descriptor.id)) return@forEach
+            // 已加载（例如冷启动恢复期间用户手动又加载过一次）就跳过，避免触发 PluginRuntime 的重复加载校验。
+            if (pluginRuntime.find(descriptor.id) != null) return@forEach
+            runCatching { loadPlugin(descriptor.source, activation.granted(descriptor.id)) }
+                .onSuccess { restored++ }
+                .onFailure { activation.setEnabled(descriptor.id, false) }
+        }
+        return restored
+    }
+
+    /** 加载本地插件并将其声明的 ProjectType 接入核心项目识别注册表。 */
+    fun loadPlugin(file: java.io.File, grantedPermissions: Set<String> = emptySet()): com.nebulaforge.core.plugin.LoadedPlugin {
+        val plugin = pluginRuntime.load(file, grantedPermissions)
+        pluginRuntime.extensionRegistry.projectTypes().forEach { ProjectTypeRegistry.register(it) }
+        return plugin
+    }
+
+    fun unloadPlugin(id: String): Boolean {
+        val removed = pluginRuntime.unload(id)
+        if (removed) {
+            pluginRuntime.extensionRegistry.extensions(com.nebulaforge.core.plugin.ExtensionPointType.PROJECT_TYPE)
+                .filterIsInstance<com.nebulaforge.core.projectmodel.ProjectType>()
+                .forEach { ProjectTypeRegistry.register(it) }
+        }
+        return removed
+    }
+
+    /**
+     * 启动「已装扩展的 JS 逻辑」宿主，并把两条输出通道接到本应用的真源上。
+     *
+     * 通道设计（都只走真源，不另造一套状态）：
+     * - 诊断：扩展 `createDiagnosticCollection().set(...)` → [MachineDiagnostics] 汇入 `DiagnosticStore`，
+     *   问题面板与编辑器波浪线立即可见（会话前缀 `extension:<pluginId>`，扩展重算整体替换，不留残影）；
+     * - 终端：扩展 `createTerminal()` + `sendText()` → 出一个**专属**会话（标题「扩展: 名字」），
+     *   绝不往用户正在交互的 shell 里注入文本（那等于让扩展偷偷替用户敲命令）。
+     *
+     * 只在有 JS 扩展时才真正拉进程：宿主内部按已装插件清单决定起停。
+     */
+    private fun startJsExtensionHost() {
+        val host = com.nebulaforge.app.plugins.JsExtensionHost.of(this)
+        host.diagnosticSink = { pluginId, path, items ->
+            runCatching {
+                val session = "extension:$pluginId"
+                val file = runCatching { java.io.File(path).absolutePath }.getOrDefault(path)
+                val mapped = items.mapNotNull { entry ->
+                    runCatching {
+                        IdeEvent.Diagnostic(
+                            sessionId = session,
+                            file = file,
+                            line = entry.line,
+                            column = entry.character,
+                            message = entry.message,
+                            severity = when (entry.severity) {
+                                0 -> Severity.ERROR
+                                1 -> Severity.WARNING
+                                else -> Severity.INFO
+                            }
+                        )
+                    }.getOrNull()
+                }
+                diagnosticStore.replaceSession(session, mapped)
+            }.onFailure { error ->
+                host.appendLog(pluginId, "warn", "扩展诊断未能汇入问题面板：${error.message}")
+            }
+        }
+        host.terminalSink = { name, text ->
+            runCatching {
+                val manager = com.nebulaforge.core.terminal.TerminalSessionManager.get(this)
+                val title = "扩展: " + name.ifBlank { "terminal" }
+                val record = manager.records.value.lastOrNull { it.title == title }
+                    ?: manager.create(
+                        cwd = com.nebulaforge.core.environment.Environment.ensureHome(this).absolutePath,
+                        title = title,
+                        client = com.nebulaforge.core.terminal.IdeTerminalSessionClient()
+                    ).first
+                manager.write(record.id, text)
+            }.onFailure { error ->
+                host.appendLog("-", "warn", "扩展终端「$name」不可用：${error.message}")
+            }
+        }
+        host.refresh(null)
+        host.activateStartupExtensions()
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        // 网页 AI 网关的**离屏** WebView 必须挂到真实窗口上：未挂载时 Chromium 不排 vsync，
+        // requestAnimationFrame 不触发 → DeepSeek/Kimi/豆包 这类 SPA 永不水合（DOM 只剩框架
+        // 根 div，1 个元素），网关侧表现为「没找到输入框」，而同一个 URL 在网关窗口里完全正常。
+        // 这里只提供「当前 Activity」给 WebAiBridge 当宿主，不改变任何界面。
+        registerActivityLifecycleCallbacks(object : android.app.Application.ActivityLifecycleCallbacks {
+            override fun onActivityCreated(activity: android.app.Activity, savedInstanceState: android.os.Bundle?) {}
+            override fun onActivityStarted(activity: android.app.Activity) {}
+            override fun onActivityResumed(activity: android.app.Activity) {
+                runCatching { com.nebulaforge.app.ai.WebAiBridge.onActivityResumed(activity) }
+            }
+            override fun onActivityPaused(activity: android.app.Activity) {
+                runCatching { com.nebulaforge.app.ai.WebAiBridge.onActivityPaused(activity) }
+            }
+            override fun onActivityStopped(activity: android.app.Activity) {}
+            override fun onActivitySaveInstanceState(activity: android.app.Activity, outState: android.os.Bundle) {}
+            override fun onActivityDestroyed(activity: android.app.Activity) {
+                runCatching { com.nebulaforge.app.ai.WebAiBridge.onActivityDestroyed(activity) }
+            }
+        })
+        // stdio MCP 需要按设备能力选通道（内嵌用户态 / Shizuku）；放在 onCreate 里注入 Context，
+        // 避免在 attachBaseContext 之前触碰 Application 的 Context 包装器。
+        com.nebulaforge.app.mcp.McpStdioProcessBridge.install(this)
+        // 后台软件监听需要「包名 → 应用名」：PackageManager 只有 app 层能用（core 不依赖 Android），
+        // 所以在这里把查询能力注入监听中心；查不到就退回包名，绝不编造应用名。
+        com.nebulaforge.app.device.AppWatchCenter.installLabelProvider { pkgs ->
+            pkgs.associateWith { p ->
+                runCatching { packageManager.getApplicationLabel(packageManager.getApplicationInfo(p, 0)).toString() }
+                    .getOrDefault(p)
+            }
+        }
+        // 最先建立私有目录骨架：终端默认 cwd、构建/LSP/工具链的自检都依赖 files/home 存在，
+        // 缺目录会被下游的 `cd ... || exit 125` 误报成「内嵌 shell 无法执行」。
+        com.nebulaforge.core.environment.Environment.ensureDirs(this)
+        // 内置 userland 里的「脚本型」工具（gradle / sdkmanager / dart / flutter / composer / mvn …）
+        // 其 shebang 与 bash.bashrc 写死 /data/data/com.termux/files/usr/...，在宿主机前缀下直接执行
+        // 会 Permission denied（表现为「装了也一律探测失败/构建跑不起来」）。
+        // 这里注入「进 proot guest 执行」的包装器，使构建、LSP、工具链探测统一走前缀对齐运行时。
+        // 注意：只做廉价的 isReady 检查，不做 ensureSetup（后者会遍历整棵 usr 树修软链，太慢）。
+        com.nebulaforge.core.exec.GuestRuntime.install { command, env, cwd ->
+            if (com.nebulaforge.core.environment.TermuxGuest.isReady(this)) {
+                com.nebulaforge.core.environment.TermuxGuest.guestCommandLine(this, command, env, cwd)
+            } else null
+        }
+        diagnosticStore = DiagnosticStore()
+        mcpHost = McpHost()
+        // 逆向能力（APK/Web/API/CA）注册为常驻 MCP Server：不随项目切换消失，
+        // 于是 MCP 面板与聚合网关从一开始就能 listTools 看到这些工具。
+        runCatching { ensureReverseMcpRegistered() }
+        pluginRuntime = PluginRuntime(this)
+        // 「安装即长期可用」：恢复上次启用的插件（含已授予的权限）。
+        // 放后台线程：读 dex、校验 plugin.xml、实例化扩展都不该拖慢冷启动。
+        Thread {
+            runCatching { restoreEnabledPlugins() }
+            // 声明式插件（VSIX 转换包）不经过 PluginRuntime 的 dex 加载，但同样必须「装了就生效」：
+            // 这里把它们的语言关联/片段/编辑器默认设置灌进编辑器内核。放在插件恢复之后，
+            // 保证「原生插件 + 声明式插件」在同一次冷启动里都就绪。
+            runCatching { DeclarativePluginLoader.of(this).refresh() }
+            // 含 JS 逻辑的扩展（VSIX 的 main）光灌声明式贡献还不够用：这里把 guest Node 扩展宿主
+            // 接起来并激活引导扩展，保证「装了扩展 → 冷启动即生效」，而不是要用户去插件页点一下。
+            runCatching { startJsExtensionHost() }
+        }.apply {
+            name = "nebula-restore-plugins"
+            isDaemon = true
+        }.start()
+        // AI 会话同样后台恢复：读会话 JSON 是磁盘 IO，不该压在冷启动路径上。
+        Thread {
+            runCatching { restoreChatSession() }
+        }.apply {
+            name = "nebula-restore-chat"
+            isDaemon = true
+        }.start()
+        toolchainManager = ToolchainManager(this)
+        toolchainDoctor = com.nebulaforge.core.toolchain.ToolchainDoctor(this)
+        aiProviders = ProviderRegistry()
+        agentPlanStore = com.nebulaforge.core.agent.AgentPlanStore(this)
+        agentPlanner = com.nebulaforge.core.agent.AiAgentPlanner(this)
+        projectMemoryStore = com.nebulaforge.core.agent.ProjectMemoryStore(this)
+        agentExperienceStore = com.nebulaforge.core.agent.AgentExperienceStore(this)
+        failurePatternStore = com.nebulaforge.core.agent.FailurePatternStore(this)
+        agentFinalFService = com.nebulaforge.core.agent.AgentFinalFService(this)
+        val embeddingSettings = com.nebulaforge.core.agent.AiProviderSettingsStore(this).load()
+        vectorRagService = com.nebulaforge.core.agent.VectorRagService(this, com.nebulaforge.core.agent.EmbeddingClient(embeddingSettings), com.nebulaforge.core.agent.VectorKnowledgeStore(this))
+        agentLearningService = com.nebulaforge.core.agent.AgentLearningService(projectMemoryStore, agentExperienceStore, this, vectorRagService, failurePatternStore)
+        agentPlanRunner = com.nebulaforge.core.agent.AgentPlanRunner(agentPlanStore)
+        // Shizuku 授权状态监听：binder 就绪/断开与授权结果都回流到 shizukuState，避免 UI 误判"未运行"。
+        com.nebulaforge.core.device.ShizukuAccess.installListeners(this) { status -> _shizukuState.value = status }
+        // 内嵌用户态回退通道：无需 Root/Shizuku，AI 也能在应用自带的 Termux 环境里执行命令。
+        com.nebulaforge.core.device.DeviceShellGate.installEmbeddedRunner { command, timeoutMs ->
+            val outcome = embeddedShellRunner.run(command, timeoutMs)
+            com.nebulaforge.core.device.DeviceShellResult(
+                command = command,
+                exitCode = outcome.exitCode,
+                stdout = outcome.stdout,
+                stderr = outcome.stderr,
+                level = com.nebulaforge.core.device.DeviceChannel.EMBEDDED,
+                durationMs = outcome.durationMs,
+                timedOut = outcome.timedOut
+            )
+        }
+        reverseEvidence = com.nebulaforge.app.reverse.ReverseEvidenceStore()
+        agentPlanStore.load()?.let { _agentPlanState.value = AgentPlanUiState(plan = it) }
+        val workspace = WorkspaceStateStore(this)
+        workspaceState = workspace
+        val sessionRegistry = SessionRegistry(this)
+        sessionRegistry.markInterruptedAfterRestart()
+        val eventJournal = SessionEventJournal(this)
+        sessionBus = IdeSessionBus(
+            journal = eventJournal,
+            registry = sessionRegistry,
+            workspace = workspace,
+            diagnostics = diagnosticStore
+        )
+        languageServices = LanguageServiceRegistry(this, sessionBus, diagnosticStore)
+        runCenter = RunCenterStore(this, sessionBus)
+        stackRunController = StackRunController(this, sessionBus)
+        runConfigurations = com.nebulaforge.core.session.RunConfigurationStore(this)
+        unifiedRunController = com.nebulaforge.core.session.UnifiedRunController(this, sessionBus, stackRunController)
+        runDevices = com.nebulaforge.core.session.RunDeviceCatalog(this)
+        sessionGraph = com.nebulaforge.core.session.SessionGraphStore(sessionBus, eventJournal)
+        sessionStateProjection = com.nebulaforge.core.session.SessionStateProjection(
+            sessionBus, kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Default)
+        )
+        problemNavigation = com.nebulaforge.core.session.ProblemNavigationStore()
+        buildFixCoordinator = com.nebulaforge.core.agent.BuildFixCoordinator(
+            this, unifiedRunController, diagnosticStore, workspace, runConfigurations.all, sessionBus
+        )
+        ProjectTypeRegistry.register(AndroidProjectType(this))
+        ProjectTypeRegistry.register(FlutterProjectType(this))
+        // TypeScript 独立工程（tsconfig.json 驱动）必须抢在 Web* 之前识别：
+        // WebFrontendProjectType 的条件是「有 scripts + 有 src/」，而任何 TS 工程都满足该条件，
+        // 若不抢先注册，TS 空项目会被判成 Vite 工程 → 构建任务全部指向不存在的 vite。
+        ProjectTypeRegistry.register(TypeScriptProjectType(this))
+        // Backend is registered before frontend so server-oriented package.json projects are classified correctly.
+        ProjectTypeRegistry.register(WebBackendProjectType(this))
+        ProjectTypeRegistry.register(WebFrontendProjectType(this))
+        ProjectTypeRegistry.register(CppProjectType())
+        // 多语言后端栈（Go / Java Spring Boot / Python / PHP / Rust）：放在 Web 之后注册，
+        // 保证带 package.json 的 Node 项目仍优先被 Web* 类型识别。
+        com.nebulaforge.stack.server.serverProjectTypes(this).forEach { ProjectTypeRegistry.register(it) }
+        // 项目目录规范化：确保公共存储可用并迁移 1.62.x 的私有目录旧项目（复制不删除，可回退）。
+        migrateProjectsIfNeeded()
+        restoreSavedMcpServers()
+    }
+
+    /**
+     * 首次启动时把旧版私有目录里的项目迁移到 /storage/emulated/0/NebulaForgeProjects。
+     *
+     * 迁移在 IO 线程执行，不阻塞启动；采用复制而非移动，公共存储不可写时静默跳过。
+     */
+    private fun migrateProjectsIfNeeded() {
+        agentScope.launch {
+            runCatching {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    if (!com.nebulaforge.core.environment.Environment.canWritePublicProjects()) return@withContext
+                    val result = com.nebulaforge.core.environment.Environment.migrateLegacyProjects(this@NebulaForgeApplication)
+                    if (result.copied > 0) {
+                        com.nebulaforge.core.environment.Environment.projectMigrationNotice.value =
+                            "已迁移 ${result.copied} 个旧项目到 ${com.nebulaforge.core.environment.Environment.publicProjectsRoot().absolutePath}" +
+                                if (result.skipped > 0) "（${result.skipped} 个同名已跳过）" else ""
+                    } else if (result.failures.isNotEmpty()) {
+                        com.nebulaforge.core.environment.Environment.projectMigrationNotice.value =
+                            "项目迁移失败：${result.failures.joinToString(", ")}"
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 启动时按持久化配置恢复外部 MCP 服务器连接。
+     *
+     * 只对 enabled && autoConnect 的服务器尝试一次 best-effort 连接：
+     * 失败不阻塞启动、不弹窗，MCP 管理页会通过 McpHost.remoteServers() 查询真实连接状态。
+     */
+    /**
+     * 统一接入一个外部 MCP 服务器：按配置选传输（HTTP 自动识别 Streamable HTTP / SSE，或 stdio 本地进程）。
+     *
+     * 为什么要统一入口：启动恢复、管理页、AI 工作台三处调用点不该各自判断传输方式，
+     * 否则每新增一种传输都要改三处。失败不抛异常，只返回 false（状态由 McpHost 的快照体现）。
+     */
+    fun connectExternalMcp(server: com.nebulaforge.app.mcp.McpServerConfig): Boolean = runCatching {
+        if (server.isStdio) {
+            if (server.command.isBlank()) return@runCatching false
+            mcpHost.connectStdio(
+                server.id,
+                server.command.trim(),
+                server.workdir.trim().ifBlank { null },
+                com.nebulaforge.app.mcp.McpStdioProcessBridge.factory
+            )
+        } else {
+            if (server.url.isBlank()) return@runCatching false
+            mcpHost.connectRemote(server.id, java.net.URI(server.url.trim()))
+        }
+        true
+    }.getOrDefault(false)
+
+    private fun restoreSavedMcpServers() {
+        val targets = runCatching {
+            com.nebulaforge.app.mcp.McpServerStore(this).load().filter { it.enabled && it.autoConnect }
+        }.getOrDefault(emptyList())
+        if (targets.isEmpty()) return
+        agentScope.launch {
+            targets.forEach { server ->
+                runCatching {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        if (connectExternalMcp(server)) {
+                            runCatching { mcpHost.initializeRemote(server.id) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun agentLearningStats(): com.nebulaforge.core.agent.LearningStats? = workspaceState.state.value.projectPath?.let { agentLearningService.learningStats(it) }
+    fun localEmbeddingStatus(): com.nebulaforge.core.agent.LocalEmbeddingModel.Status = agentFinalFService.localEmbedding.status()
+    fun recentFailurePatterns(limit: Int = 8): List<com.nebulaforge.core.agent.FailurePattern> = workspaceState.state.value.projectPath?.let { failurePatternStore.recall(it, "", limit) }.orEmpty()
+    fun exportAgentTrainingDataset(): java.io.File? = workspaceState.state.value.projectPath?.let { agentLearningService.exportTrainingDataset(it) }
+
+    /**
+     * 计划执行器里「一步补全」类步骤（事实核验 / 逆向证据分析 / 修改方案）共用的客户端。
+     *
+     * 与任务台同源：在线 API 优先，「AI 聚合网关」（网页 AI）兜底，
+     * 彻底去掉这些步骤里写死的 `check(apiKey.isNotBlank())`。
+     */
+    private fun agentStepCompletionClient(): com.nebulaforge.core.agent.AiCompletionClient =
+        com.nebulaforge.app.ai.resolveAgentCompletionClient(
+            this,
+            com.nebulaforge.core.agent.AiProviderSettingsStore(this).load()
+        )
+
+    fun createAgentPlan(request: String) {
+        _agentPlanState.value = _agentPlanState.value.copy(busy = true, message = "AI 正在建立执行计划…")
+        agentScope.launch {
+            runCatching {
+                // 后端与任务台同源：在线 API 优先，「AI 聚合网关」（网页 AI）兜底。
+                // 修掉「只接了网页 AI 就永远『AI Provider 未启用或 API Key 为空』」。
+                val client = com.nebulaforge.app.ai.resolveAgentCompletionClient(
+                    this@NebulaForgeApplication,
+                    com.nebulaforge.core.agent.AiProviderSettingsStore(this@NebulaForgeApplication).load()
+                )
+                agentPlanner.createPlan(request, workspaceState.state.value.projectPath, client)
+            }
+                .onSuccess { plan ->
+                    agentPlanStore.save(plan)
+                    _agentPlanState.value = AgentPlanUiState(plan = plan, busy = false, message = "计划已建立，请审查后批准执行")
+                }
+                .onFailure { _agentPlanState.value = _agentPlanState.value.copy(busy = false, message = "计划建立失败：${it.message ?: it.javaClass.simpleName}") }
+        }
+    }
+
+    fun executeAgentPlan() {
+        val plan = _agentPlanState.value.plan ?: return
+        val approved = plan.copy(status = com.nebulaforge.core.agent.AgentPlanStatus.APPROVED)
+        agentPlanStore.save(approved)
+        _agentPlanState.value = _agentPlanState.value.copy(plan = approved, busy = true, message = "Agent 开始执行计划…")
+        agentScope.launch {
+            agentPlanRunner.run(approved, workspaceState.state.value.projectPath, object : com.nebulaforge.core.agent.AgentPlanExecutor {
+                override suspend fun execute(step: com.nebulaforge.core.agent.AgentPlanStep, projectPath: String?): String {
+                    // 惰性求值：终端命令类步骤不依赖项目，只有真正用到项目目录的步骤才会因未打开项目而失败。
+                    val root by lazy { projectPath?.let { java.io.File(it) } ?: throw IllegalStateException("当前没有打开项目") }
+                    return when (step.action) {
+                        com.nebulaforge.core.agent.AgentPlanAction.ANALYZE_PROJECT -> {
+                            val files = root.walkTopDown().filter { it.isFile }.take(200).count()
+                            "项目分析完成：已检查文件 $files 个（最多 200 个）"
+                        }
+                        com.nebulaforge.core.agent.AgentPlanAction.RECALL_MEMORY -> {
+                            val q = step.description.ifBlank { _agentPlanState.value.plan?.userRequest ?: "项目" }
+                            val memory = projectMemoryStore.buildContext(root.absolutePath, q, 12)
+                            val experiences = agentExperienceStore.buildContext(root.absolutePath, q, 8)
+                            val lexical = agentLearningService.recallKnowledge(root.absolutePath, q, 10)
+                            val vectors = agentLearningService.recallVectorKnowledge(root.absolutePath, q, 10)
+                            val failures = failurePatternStore.recall(root.absolutePath, q, 6)
+                            "项目记忆：\n${memory.ifBlank { "暂无相关项目记忆" }}\n\n项目经验：\n${experiences.ifBlank { "暂无相关经验" }}\n\n本地混合检索：\n${lexical.joinToString("\n") { "- ${it.text}" }}\n\nEmbedding 向量检索：\n${vectors.joinToString("\n") { "- ${it.text} (score=${"%.3f".format(it.score)})" }}\n\n失败模式：\n${failures.joinToString("\n") { "- ${it.title}: ${it.remediation}" }}".take(24000)
+                        }
+                        com.nebulaforge.core.agent.AgentPlanAction.SEARCH_WEB -> {
+                            val query = step.description.ifBlank { _agentPlanState.value.plan?.userRequest ?: "Nebula Forge IDE" }
+                            val local = agentLearningService.recallKnowledge(root.absolutePath, query, 8)
+                            val vectors = agentLearningService.recallVectorKnowledge(root.absolutePath, query, 8)
+                            val results = agentWebSearch.search(query, 8)
+                            if (results.isEmpty()) return@execute "没有找到搜索结果"
+                            val evidence = results.take(3).mapNotNull { result ->
+                                runCatching { agentWebSearch.fetchEvidence(result.url, 6000) }.getOrNull()
+                            }
+                            val citations = agentFinalFService.citations.citations(results)
+                            val rendered = results.joinToString("\n") { r ->
+                                val c = agentFinalFService.sourceCredibility.score(r.url)
+                                "- ${r.title}\n  来源：${r.source}\n  URL：${r.url}\n  可信度：${"%.2f".format(c.score)}（${c.tier}）\n  摘要：${r.snippet}"
+                            }
+                            val pages = evidence.mapIndexed { index, e -> "[网页证据 ${index + 1}] ${e.title}\nURL：${e.url}\n${e.text.take(6000)}" }.joinToString("\n\n")
+                            agentFinalFService.citations.append("本地相关经验：\n${local.joinToString("\n") { "- ${it.text}" }}\n\n向量相关经验：\n${vectors.joinToString("\n") { "- ${it.text}" }}\n\n搜索结果：\n$rendered\n\n网页证据：\n${pages.ifBlank { "未能读取搜索结果网页正文，仅保留搜索摘要。" }}", citations).take(30000)
+                        }
+                        com.nebulaforge.core.agent.AgentPlanAction.VERIFY_WEB_FACTS -> {
+                            val claim = step.description.ifBlank { _agentPlanState.value.plan?.userRequest ?: error("缺少待验证事实") }
+                            val results = agentWebSearch.search(claim, 8)
+                            val evidence = results.take(6).mapNotNull { runCatching { agentWebSearch.fetchEvidence(it.url, 9000) }.getOrNull() }
+                            if (evidence.size < 2) return@execute "事实核验失败：有效网页证据少于 2 个"
+                            val verifier = com.nebulaforge.core.agent.AgentWebFactVerifier(this@NebulaForgeApplication.agentStepCompletionClient())
+                            val check = verifier.verify(claim, evidence)
+                            "事实：$claim\n结论：${check.verdict}\n置信度：${check.confidence}\n支持来源：${check.supportingSources.joinToString(", ")}\n冲突来源：${check.conflictingSources.joinToString(", ")}\n理由：${check.rationale}"
+                        }
+                        com.nebulaforge.core.agent.AgentPlanAction.BUILD -> {
+                            val config = runConfigurations.forProject(root).firstOrNull() ?: throw IllegalStateException("当前项目没有运行/构建配置")
+                            var last = "构建已提交"
+                            unifiedRunController.build(config).collect { event ->
+                                last = event.toString().take(2000)
+                            }
+                            "构建执行完成：$last"
+                        }
+                        com.nebulaforge.core.agent.AgentPlanAction.RUN -> {
+                            val config = runConfigurations.forProject(root).firstOrNull() ?: throw IllegalStateException("当前项目没有运行配置")
+                            var last = "运行已启动"
+                            unifiedRunController.run(config).collect { event ->
+                                last = event.toString().take(2000)
+                            }
+                            "运行流程完成：$last"
+                        }
+                        com.nebulaforge.core.agent.AgentPlanAction.EXECUTE_COMMAND -> {
+                            val command = com.nebulaforge.core.device.ShellCommandText.extract(step.description)
+                            if (command.isBlank()) {
+                                "命令步骤没有解析出可执行命令，已跳过（步骤 description 必须包含完整命令）"
+                            } else {
+                                aiTerminal.execForAi(command, 90_000)
+                            }
+                        }
+                        com.nebulaforge.core.agent.AgentPlanAction.INSPECT_APK -> {
+                            val apk = root.walkTopDown().firstOrNull { it.isFile && it.extension.equals("apk", true) } ?: throw IllegalStateException("项目中未找到 APK")
+                            val engine = com.nebulaforge.app.reverse.ApkReverseEngine(this@NebulaForgeApplication)
+                            val report = engine.inspect(apk)
+                            reverseEvidence.setApkEvidence(apk.absolutePath, "SHA-256=${report.sha256}; DEX=${report.dexCount}; URL=${report.urls.size}; Native=${report.nativeLibraries.size}; 权限=${report.manifestSummary.permissions.size}")
+                            val client = runCatching { this@NebulaForgeApplication.agentStepCompletionClient() }.getOrNull()
+                            if (client != null) {
+                                val ai = com.nebulaforge.app.reverse.ai.ReverseAiAssistant(client)
+                                "APK 分析完成：${ai.analyzeApk(report).take(6000)}"
+                            } else {
+                                "APK 分析完成：${report.manifestSummary.packageName ?: "未知包名"}；DEX=${report.dexCount}；URL=${report.urls.size}；Native=${report.nativeLibraries.size}"
+                            }
+                        }
+                        com.nebulaforge.core.agent.AgentPlanAction.INSPECT_WEB -> {
+                            val records = reverseEvidence.webRecorder.records.value
+                            if (records.isEmpty()) "Web 暂无捕获证据：请先在 Web 逆向工作台加载目标并产生网络事件" else {
+                                val ai = com.nebulaforge.app.reverse.ai.ReverseAiAssistant(this@NebulaForgeApplication.agentStepCompletionClient())
+                                ai.analyzeWeb(records).take(6000)
+                            }
+                        }
+                        com.nebulaforge.core.agent.AgentPlanAction.INSPECT_API -> {
+                            val endpoints = reverseEvidence.apiRegistry.all()
+                            if (endpoints.isEmpty()) "API 暂无捕获证据：请先启动 MITM 并产生真实端点" else {
+                                val ai = com.nebulaforge.app.reverse.ai.ReverseAiAssistant(this@NebulaForgeApplication.agentStepCompletionClient())
+                                ai.analyzeApi(endpoints).take(6000)
+                            }
+                        }
+                        com.nebulaforge.core.agent.AgentPlanAction.DISCOVER_MCP -> {
+                            val local = mcpHost.serverIds().joinToString().ifBlank { "暂无本地 MCP" }
+                            val remote = runCatching { com.nebulaforge.app.plugins.ExternalPluginSources.loadMcpServers(20).take(10).joinToString("、") { it.name } }.getOrElse { "Registry 查询失败：${it.message}" }
+                            "本地 MCP：$local；真实 Registry 可发现服务：$remote"
+                        }
+                        com.nebulaforge.core.agent.AgentPlanAction.PROPOSE_MODIFICATION -> {
+                            val ai = com.nebulaforge.app.reverse.ai.ReverseAiAssistant(this@NebulaForgeApplication.agentStepCompletionClient())
+                            val apkPath = reverseEvidence.lastApkPath
+                            val workspace = apkPath?.let { com.nebulaforge.app.reverse.ApkReverseEngine(this@NebulaForgeApplication).workspaceFor(java.io.File(it)) }
+                            val target = step.description.substringAfter("file=", "").substringBefore(" ").takeIf { it.isNotBlank() }
+                            val file = target?.let { java.io.File(it) } ?: workspace?.resolve("apktool/AndroidManifest.xml")
+                            check(file != null && file.isFile) { "没有找到可供 AI 审查的逆向文件，请在计划步骤描述中指定 file=路径，或先完成 APK 反编译" }
+                            val original = file.readText(Charsets.UTF_8)
+                            val goal = step.description.substringAfter("goal=", "请根据用户需求提出最小化修改方案").trim()
+                            val proposal = ai.proposeStructuredModification(file.absolutePath, original, goal)
+                            "修改方案已生成：风险=${proposal.risk}；${proposal.explanation.take(4500)}${proposal.unifiedDiff?.let { "\n\n--- Unified Diff ---\n$it" } ?: "\n\n未生成可安全应用的 Diff，需要人工检查。"}"
+                        }
+                        com.nebulaforge.core.agent.AgentPlanAction.APPLY_REVIEWED_CHANGES -> throw IllegalStateException("修改必须先通过 Diff 审查，不能由计划直接自动接受")
+                        com.nebulaforge.core.agent.AgentPlanAction.VERIFY_RESULT -> {
+                            val snapshot = reverseEvidence.snapshot()
+                            val diagnostics = diagnosticStore.all().takeLast(20).joinToString("\n")
+                            "验证快照：APK=${snapshot.apkPath ?: "无"}，Web=${snapshot.webCount} 条，API=${snapshot.apiCount} 个。最近诊断：${diagnostics.ifBlank { "无" }}"
+                        }
+                        com.nebulaforge.core.agent.AgentPlanAction.UNKNOWN -> throw IllegalStateException("计划包含未知动作")
+                    }
+                }
+            }, onUpdate = { planState ->
+                _agentPlanState.value = AgentPlanUiState(plan = planState)
+                // 计划的每一步执行结果都同步成 AI 工作台里的工具卡片（可展开看输出行数）。
+                runCatching { syncPlanToolCards(planState) }
+            })
+            val finalPlan = _agentPlanState.value.plan
+            val project = workspaceState.state.value.projectPath
+            if (finalPlan != null && project != null) {
+                runCatching { agentLearningService.learnFromResult(project, finalPlan.userRequest, finalPlan) }
+            }
+            _agentPlanState.value = _agentPlanState.value.copy(busy = false, message = "计划执行状态：${_agentPlanState.value.plan?.status}；经验已归档")
+        }
+    }
+
+    /**
+     * 7.4 聊天模式：仅返回文本回复。
+     *
+     * 与任务模式的区别是**行为层面**的：这里绝不调用 AgentPlanRunner，
+     * 不写入任何项目文件，也不触发构建/运行，因此不会产生需要 6.4 Diff 审查的变更。
+     *
+     * 本次修掉的三个「对话总是被截断」根因：
+     *  1. 旧实现只把**用户消息**拼成 prompt，模型看不到自己上一轮说了什么 → 现在传完整的
+     *     user/assistant 交替历史，并按上下文窗口预算从最旧处裁剪；
+     *  2. 服务端 `max_tokens` 被写死 2048，长回答生成到一半就被硬截断 → 现在用配置里的
+     *     maxTokens（默认 8192），且 finish_reason=length 时明确标注「已截断」并给出「继续」；
+     *  3. 无流式 + 只存内存 → 现在 SSE 逐字上屏，消息实时落盘，切页/重启都不丢。
+     */
+    fun sendChatMessage(text: String) = sendTaskMessage(text)
+
+    /**
+     * 任务模式入口：一条消息 + 可选附件，交给 AI 自主决定是否调用工具。
+     *
+     * 与旧的「聊天模式」的区别不是文案而是行为：这里 AI 真的可以
+     * 读项目文件、执行命令、联网检索、写文件（写前逐条 Diff 确认），
+     * 并把结论沉淀回项目记忆/经验库。
+     */
+    fun sendTaskMessage(text: String, attachments: List<com.nebulaforge.core.agent.AiAttachment> = emptyList()) {
+        val message = text.trim()
+        val pending = attachments.ifEmpty { _chatState.value.pendingAttachments }
+        if (message.isEmpty() && pending.isEmpty()) return
+        if (chatJob?.isActive == true) {
+            _chatState.value = _chatState.value.copy(message = "上一轮仍在执行中，请先停止或等待完成")
+            return
+        }
+        val sessionId = ensureSession(message.ifBlank { pending.firstOrNull()?.name ?: "附件" })
+        approvalBroker.reset()
+        // 新一轮任务：先把上一轮的计划收起来。否则 hasActivePlan() 会一直是 true，
+        // 这一轮就再也不需要（也不会）立计划——面板上自然看不到「AI 自己定的步骤」。
+        if (_agentPlanState.value.plan != null) {
+            autoPlanId = null
+            _agentPlanState.value = AgentPlanUiState()
+            runCatching { agentPlanStore.clear() }
+        }
+        _chatState.value = _chatState.value.copy(
+            activeSessionId = sessionId,
+            messages = _chatState.value.messages + AiChatMessage(
+                role = AiMessageRole.USER,
+                text = message.ifBlank { "（见附件）" },
+                attachments = pending
+            ),
+            pendingAttachments = emptyList(),
+            busy = true,
+            phase = AiTaskPhase.THINKING,
+            toolRounds = 0,
+            message = "",
+            // ★ 任务计时起点：顶栏据此实时显示「用时 01:23」。
+            taskStartedAt = System.currentTimeMillis(),
+            taskFinishedAt = 0L
+        )
+        persistChat()
+        launchCompletion(sessionId)
+    }
+
+    // ------------------------------------------------------------ 附件
+
+    /** 选择器回调：把 URI 变成附件（复制到私有目录、图片压缩、文本抽取）。 */
+    fun attachUri(uri: android.net.Uri) {
+        if (_chatState.value.pendingAttachments.size >= MAX_PENDING_ATTACHMENTS) {
+            _chatState.value = _chatState.value.copy(
+                message = "附件数量已达上限（$MAX_PENDING_ATTACHMENTS 个），请先发送或移除后再添加"
+            )
+            return
+        }
+        // ★ 立刻给反馈，再去后台干活：几百 MB 的 APK 复制 + 抽条目清单在主线程要卡好几秒，
+        //   界面完全不动，用户只会以为「点了上传没反应」。
+        _chatState.value = _chatState.value.copy(message = "正在读取附件…")
+        attachScope.launch {
+            val prepared = com.nebulaforge.app.ai.AttachmentPreparer.prepare(this@NebulaForgeApplication, uri)
+            withContext(Dispatchers.Main) {
+                if (prepared == null) {
+                    android.util.Log.w("NbAttach", "附件读取失败 uri=$uri")
+                    _chatState.value = _chatState.value.copy(
+                        message = "附件读取失败：无法打开该文件（系统未授权、文件超过 512MB 或已被移动/删除）"
+                    )
+                } else {
+                    android.util.Log.i(
+                        "NbAttach",
+                        "附件已添加 name=${prepared.name} kind=${prepared.kind} size=${prepared.sizeLabel} " +
+                            "mime=${prepared.mime} 抽取字符=${prepared.text.length} 有图=${prepared.imageBase64.isNotEmpty()}"
+                    )
+                    _chatState.value = _chatState.value.copy(
+                        pendingAttachments = _chatState.value.pendingAttachments + prepared,
+                        message = "已添加附件：${prepared.chipLabel}"
+                    )
+                }
+            }
+        }
+    }
+
+    /** 已知路径（项目内文件）直接加附件；同样走 IO 线程，避免大文件卡界面。 */
+    fun attachFile(file: java.io.File) {
+        if (_chatState.value.pendingAttachments.size >= MAX_PENDING_ATTACHMENTS) {
+            _chatState.value = _chatState.value.copy(message = "附件数量已达上限（$MAX_PENDING_ATTACHMENTS 个）")
+            return
+        }
+        _chatState.value = _chatState.value.copy(message = "正在读取附件…")
+        attachScope.launch {
+            val prepared = com.nebulaforge.app.ai.AttachmentPreparer.prepareFile(this@NebulaForgeApplication, file)
+            withContext(Dispatchers.Main) {
+                if (prepared == null) {
+                    _chatState.value = _chatState.value.copy(message = "附件读取失败：${file.name}")
+                } else {
+                    _chatState.value = _chatState.value.copy(
+                        pendingAttachments = _chatState.value.pendingAttachments + prepared,
+                        message = "已添加附件：${prepared.chipLabel}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun removePendingAttachment(id: String) {
+        val target = _chatState.value.pendingAttachments.firstOrNull { it.id == id }
+        if (target != null) com.nebulaforge.app.ai.AttachmentPreparer.remove(this, target.path)
+        _chatState.value = _chatState.value.copy(pendingAttachments = _chatState.value.pendingAttachments.filterNot { it.id == id })
+    }
+
+    companion object {
+        /** 单轮附件数量上限：再多也吸不进上下文，只会互相挤掉。 */
+        const val MAX_PENDING_ATTACHMENTS = 12
+
+        /** 常驻逆向 MCP Server 的 id：不随项目切换而消失，保证逆向工具始终可见可调。 */
+        const val REVERSE_MCP_ID = "reverse"
+    }
+
+    fun clearPendingAttachments() {
+        _chatState.value.pendingAttachments.forEach { com.nebulaforge.app.ai.AttachmentPreparer.remove(this, it.path) }
+        _chatState.value = _chatState.value.copy(pendingAttachments = emptyList())
+    }
+
+    // ------------------------------------------------------------ 权限开关
+
+    fun setOnline(enabled: Boolean) {
+        taskFlags.edit().putBoolean(KEY_ONLINE, enabled).apply()
+        _chatState.value = _chatState.value.copy(online = enabled)
+    }
+
+    /** 全自动（免审批）开关：默认开；关掉即恢复逐条确认。 */
+    fun setAutoApproveAll(enabled: Boolean) {
+        taskFlags.edit().putBoolean(KEY_AUTO_APPROVE, enabled).apply()
+        approvalBroker.setAutoAll(enabled)
+    }
+
+    fun setAllowCommand(enabled: Boolean) {
+        taskFlags.edit().putBoolean(KEY_ALLOW_COMMAND, enabled).apply()
+        _chatState.value = _chatState.value.copy(allowCommand = enabled)
+    }
+
+    fun setAllowWrite(enabled: Boolean) {
+        taskFlags.edit().putBoolean(KEY_ALLOW_WRITE, enabled).apply()
+        _chatState.value = _chatState.value.copy(allowWrite = enabled)
+    }
+
+    // ------------------------------------------------------------ 审批
+
+    /** 用户对「执行命令 / 写文件」待确认操作的决定。 */
+    fun resolveApproval(approved: Boolean, remember: Boolean = false) = approvalBroker.resolve(approved, remember)
+
+    // ------------------------------------------------------------ 妙招 / 技能 / 记忆
+
+    fun toggleTrick(id: String) {
+        val trick = capabilities.tricks.list().firstOrNull { it.id == id } ?: return
+        capabilities.tricks.setEnabled(id, !trick.enabled)
+        refreshWorkbenchPanels()
+    }
+
+    fun deleteTrick(id: String) {
+        capabilities.tricks.delete(id)
+        refreshWorkbenchPanels()
+    }
+
+    /** 用户手搓一个妙招（AI 也能通过 create_trick 工具创建）。 */
+    fun createTrick(name: String, summary: String, promptPatch: String) {
+        if (name.isBlank() || promptPatch.isBlank()) return
+        capabilities.tricks.upsert(
+            com.nebulaforge.core.agent.AgentTrick(
+                name = name.trim(), summary = summary.trim(), promptPatch = promptPatch.trim(), author = "user"
+            )
+        )
+        refreshWorkbenchPanels()
+    }
+
+    /** 用户手搓一个技能（AI 也能通过 create_skill 工具创建）。 */
+    fun createSkill(name: String, description: String, body: String, entry: String, script: String): Boolean {
+        if (name.isBlank()) return false
+        capabilities.skills.create(
+            name = name.trim(),
+            description = description.trim(),
+            body = body.trim(),
+            entry = entry.trim(),
+            script = script,
+            tools = emptyList(),
+            author = "user"
+        )
+        refreshWorkbenchPanels()
+        return true
+    }
+
+    /**
+     * 手动运行技能入口脚本（工作台「运行」按钮）。
+     *
+     * 复用 AI 终端通道：安全策略 + 审计 + 通道自动选择（Root → Shizuku → 内嵌 bootstrap），
+     * 因此无 Root 设备上走 Shizuku（shell uid=2000）也能跑；脚本以项目目录为工作目录。
+     */
+    fun runSkillNow(id: String): String {
+        val skill = capabilities.skills.list().firstOrNull { it.id == id } ?: return "技能不存在（可能已被删除）"
+        if (!skill.hasEntry) {
+            return "「${skill.name}」是说明型技能：没有入口脚本，交给 AI 用工具按说明执行即可。"
+        }
+        val entryFile = capabilities.skills.entryFile(skill.id) ?: return "入口脚本缺失：${skill.entry}"
+        val project = currentProjectPath()
+        val cmd = buildString {
+            if (project != null) append("cd ").append(project).append(" && ")
+            append("sh ").append(entryFile.absolutePath)
+        }
+        val output = runCatching { execOnDevice(cmd, 120_000) }
+            .getOrElse { "执行异常：${it.message ?: it.javaClass.simpleName}" }
+        capabilities.skills.markRun(skill.id)
+        refreshWorkbenchPanels()
+        return output
+    }
+
+    fun deleteSkill(id: String) {
+        capabilities.skills.delete(id)
+        refreshWorkbenchPanels()
+    }
+
+    fun deleteMemory(id: String) {
+        val project = currentProjectPath() ?: return
+        capabilities.memories.delete(project, id)
+        refreshWorkbenchPanels()
+    }
+
+    fun clearMemories() {
+        val project = currentProjectPath() ?: return
+        capabilities.memories.clear(project)
+        refreshWorkbenchPanels()
+    }
+
+    fun deleteExperience(id: String) {
+        val project = currentProjectPath() ?: return
+        capabilities.experiences.delete(project, id)
+        refreshWorkbenchPanels()
+    }
+
+    fun setExperienceVerified(id: String, verified: Boolean) {
+        val project = currentProjectPath() ?: return
+        capabilities.experiences.setVerified(project, id, verified)
+        refreshWorkbenchPanels()
+    }
+
+    /** 用户对最近一条回答的 👍/👎：写入学习记录，供后续召回排序。 */
+    fun rateLastAnswer(positive: Boolean) {
+        val messages = _chatState.value.messages
+        val answer = messages.lastOrNull { it.role == AiMessageRole.ASSISTANT && it.text.isNotBlank() }?.text ?: return
+        val question = messages.lastOrNull { it.role == AiMessageRole.USER }?.text.orEmpty()
+        val project = currentProjectPath() ?: return
+        agentScope.launch {
+            runCatching { capabilities.recordFeedback(project, question, answer, positive) }
+            _chatState.value = _chatState.value.copy(message = if (positive) "已记录：这次回答有帮助（下次优先参考）" else "已记录：这次回答不够好，会在后续避免同类做法")
+        }
+    }
+
+    /** 停止生成：取消当前流，保留已收到的部分（不让用户白等）。 */
+    fun stopChatGeneration() {
+        chatJob?.cancel()
+        chatJob = null
+        // 先解开挂起的审批，再收尾状态：否则工具协程会卡在 awaitApproval 上。
+        approvalBroker.reset()
+        // ★ 工具卡片也要收尾：否则点了「停止」卡片仍显示「执行中…」（真机复现）。
+        settleStreamingCards("已手动停止（工具未返回结果）")
+        _chatState.value = _chatState.value.copy(
+            busy = false,
+            streaming = false,
+            phase = AiTaskPhase.IDLE,
+            message = "已停止"
+        )
+        persistChat()
+    }
+
+    /** 达到 max_tokens 被截断后继续写（把已有回答作为上下文）。 */
+    fun continueChatGeneration() {
+        if (chatJob?.isActive == true) return
+        val sessionId = _chatState.value.activeSessionId ?: return
+        _chatState.value = _chatState.value.copy(busy = true, message = "")
+        launchCompletion(sessionId, continueMode = true)
+    }
+
+    /** 重新生成最后一条回答。 */
+    fun regenerateLastReply() {
+        if (chatJob?.isActive == true) return
+        val sessionId = _chatState.value.activeSessionId ?: return
+        val messages = _chatState.value.messages.toMutableList()
+        val index = messages.indexOfLast { it.role == AiMessageRole.ASSISTANT && it.text.isNotBlank() }
+        if (index < 0) return
+        messages.removeAt(index)
+        _chatState.value = _chatState.value.copy(messages = messages, busy = true, message = "")
+        launchCompletion(sessionId)
+    }
+
+    /** 新建会话（不删除旧会话）。 */
+    fun newChatSession() {
+        chatJob?.cancel()
+        chatJob = null
+        approvalBroker.reset()
+        _chatState.value = _chatState.value.copy(
+            activeSessionId = null, messages = emptyList(), busy = false,
+            streaming = false, contextTokens = 0, message = "",
+            phase = AiTaskPhase.IDLE, toolRounds = 0, pendingAttachments = emptyList()
+        )
+    }
+
+    /** 切换到历史会话。 */
+    fun switchChatSession(sessionId: String) {
+        chatJob?.cancel()
+        chatJob = null
+        approvalBroker.reset()
+        val messages = chatStore.messages(sessionId)
+        _chatState.value = _chatState.value.copy(
+            activeSessionId = sessionId, messages = messages, busy = false, streaming = false,
+            message = "", phase = AiTaskPhase.IDLE, toolRounds = 0,
+            contextTokens = messages.sumOf { estimateTokens(it.text) + estimateTokens(it.reasoning) }
+        )
+    }
+
+    /** 删除某个会话。 */
+    fun deleteChatSession(sessionId: String) {
+        chatStore.delete(sessionId)
+        val remained = chatStore.metas()
+        if (_chatState.value.activeSessionId == sessionId) {
+            val next = remained.firstOrNull()
+            _chatState.value = _chatState.value.copy(
+                sessions = remained, activeSessionId = next?.id,
+                messages = next?.let { chatStore.messages(it.id) }.orEmpty(), busy = false, streaming = false
+            )
+        } else {
+            _chatState.value = _chatState.value.copy(sessions = remained)
+        }
+    }
+
+    /**
+     * 把所有还挂在「执行中」的卡片一次性收尾（失败 / 停止 / 异常三条路径共用）。
+     *
+     * 真机实测的严重缺陷：工具抛异常或被停止时，旧代码只收尾**最后一条助手消息**，
+     * 工具卡片仍留着 `streaming = true` —— 界面于是永远显示「执行中…」、计时器一直走，
+     * 用户报告「AI 工作台构建失败也不会停止」。这里按角色分别收尾：
+     *  - TOOL：标失败原因 + 结束时间，输出尾部追加一行 ✗（计时随之冻结）；
+     *  - 其他：只把流式关掉（正文保留，不让用户白等）。
+     */
+    private fun settleStreamingCards(reason: String) {
+        val msgs = _chatState.value.messages
+        if (msgs.none { it.streaming }) return
+        val now = System.currentTimeMillis()
+        _chatState.value = _chatState.value.copy(
+            messages = msgs.map { m ->
+                when {
+                    !m.streaming -> m
+                    m.role == AiMessageRole.TOOL -> m.copy(
+                        streaming = false,
+                        toolFinishedAt = now,
+                        error = m.error ?: reason,
+                        toolOutput = if (m.error != null) m.toolOutput
+                        else m.toolOutput.trimEnd() + "\n\n✗ " + reason
+                    )
+                    else -> m.copy(streaming = false)
+                }
+            }
+        )
+    }
+
+    /** 删除单条消息。 */
+    fun deleteChatMessage(messageId: String) {
+        _chatState.value = _chatState.value.copy(messages = _chatState.value.messages.filterNot { it.id == messageId })
+        persistChat()
+    }
+
+    /**
+     * 任务面板「清空已结束」：删掉本会话里**已结束**的工具卡片（运行中的保留）。
+     *
+     * 工具卡片只占界面不占上下文（不进提示词），所以长任务跑一晚上会堆出几十张卡片；
+     * 用户清的是界面噪音，运行中的那张必须留着，否则「已调用 N 轮」就断了线索。
+     */
+    fun clearFinishedToolCards() {
+        val current = _chatState.value.messages
+        val kept = current.filter { !(it.role == AiMessageRole.TOOL && !it.streaming) }
+        if (kept.size == current.size) return
+        _chatState.value = _chatState.value.copy(messages = kept)
+        persistChat()
+    }
+
+    // ------------------------------------------------------------ 消息长按菜单
+
+    /**
+     * 长按消息弹出的菜单（复制 / 钉住 / 编辑 / 快捷指令 / 从上下文移除 / 回滚 / 分支 / 删除 …）。
+     *
+     * 这些动作都作用在**消息本身**，不是「重开一轮对话」：长对话里真正需要的纠偏手段是
+     * 「把某几条移出上下文」「回滚到某一句再重发」「从某一句分叉出去」，而不是清空重来。
+     */
+    private fun chatMessage(id: String): AiChatMessage? =
+        _chatState.value.messages.firstOrNull { it.id == id }
+
+    /** 就地替换一条消息并落盘；返回 false = 消息已不存在（例如刚被删）。 */
+    private fun updateChatMessage(id: String, transform: (AiChatMessage) -> AiChatMessage): Boolean {
+        var hit = false
+        val next = _chatState.value.messages.map {
+            if (it.id == id) {
+                hit = true
+                transform(it)
+            } else it
+        }
+        if (!hit) return false
+        _chatState.value = _chatState.value.copy(messages = next)
+        persistChat()
+        return true
+    }
+
+    /** 钉住 / 取消钉住：钉住的消息永远拼进提示词（即使已滑出上下文预算窗口）。 */
+    fun pinChatMessage(id: String) {
+        val message = chatMessage(id) ?: return
+        val next = !message.pinned
+        updateChatMessage(id) { it.copy(pinned = next) }
+        _chatState.value = _chatState.value.copy(
+            message = if (next) "已钉住：这条会一直发给大模型，即使它已滑出上下文窗口" else "已取消钉住"
+        )
+    }
+
+    /**
+     * 把消息移出/放回上下文。[collapsed] = true 是菜单里的「从上下文移除」（折叠成一行），
+     * false 是「保留显示，不发给大模型」（显示照旧，只是不拼进提示词）。
+     */
+    fun excludeChatMessage(id: String, collapsed: Boolean) {
+        val message = chatMessage(id) ?: return
+        val next = !message.excludedFromContext
+        updateChatMessage(id) {
+            it.copy(excludedFromContext = next, contextCollapsed = if (next) collapsed else false)
+        }
+        _chatState.value = _chatState.value.copy(
+            message = if (next) "已移出上下文：这条不再发给大模型（消息仍保留，可再点一次恢复）"
+            else "已放回上下文：这条重新发给大模型"
+        )
+    }
+
+    /** 编辑消息正文（菜单「编辑」）。 */
+    fun editChatMessage(id: String, text: String) {
+        if (text.isBlank()) return
+        updateChatMessage(id) { it.copy(text = text) }
+        _chatState.value = _chatState.value.copy(message = "已保存修改")
+    }
+
+    /** 删除这条**之后**的所有消息（菜单「删除之后的所有消息」）。 */
+    fun deleteChatMessagesAfter(id: String) {
+        val messages = _chatState.value.messages
+        val index = messages.indexOfFirst { it.id == id }
+        if (index < 0) return
+        _chatState.value = _chatState.value.copy(messages = messages.take(index + 1))
+        persistChat()
+        _chatState.value = _chatState.value.copy(message = "已删除这之后的消息（本条保留）")
+    }
+
+    /**
+     * 回滚到此消息：截断到这条，并把它的正文放回输入框。
+     *
+     * 与「删除之后的所有消息」的区别是它**把话还给你**：改两个字就能重新发，
+     * 不用把长指令重敲一遍——长对话纠偏时这是最高频的动作。
+     */
+    fun rollbackToChatMessage(id: String) {
+        val message = chatMessage(id) ?: return
+        deleteChatMessagesAfter(id)
+        if (message.role == AiMessageRole.USER) {
+            pushComposerDraft(message.text)
+            _chatState.value = _chatState.value.copy(message = "已回滚到此消息，内容已放回输入框")
+        } else {
+            _chatState.value = _chatState.value.copy(message = "已回滚到此条回答")
+        }
+    }
+
+    /** 从此处分支：把这条（含）之前的消息复制成一个**新会话**并切过去，原会话不动。 */
+    fun branchChatSession(id: String) {
+        val messages = _chatState.value.messages
+        val index = messages.indexOfFirst { it.id == id }
+        if (index < 0) return
+        chatJob?.cancel()
+        chatJob = null
+        approvalBroker.reset()
+        val branch = messages.take(index + 1).map { it.copy(streaming = false) }
+        val firstUser = branch.firstOrNull { it.role == AiMessageRole.USER }?.text.orEmpty()
+        val newId = chatStore.newSessionId()
+        val now = System.currentTimeMillis()
+        val title = "分支 · " + chatStore.titleFrom(firstUser.ifBlank { "会话" })
+        val meta = AiSessionMeta(
+            id = newId, title = title, messageCount = branch.size,
+            tokens = branch.sumOf { estimateTokens(it.text) + estimateTokens(it.reasoning) },
+            createdAt = now, updatedAt = now
+        )
+        chatStore.save(meta, branch)
+        _chatState.value = _chatState.value.copy(
+            sessions = chatStore.metas(),
+            activeSessionId = newId,
+            messages = branch,
+            busy = false,
+            streaming = false,
+            toolRounds = 0,
+            phase = AiTaskPhase.IDLE,
+            contextTokens = meta.tokens,
+            message = "已从此处分支：新会话「$title」"
+        )
+    }
+
+    // ------------------------------------------------------------ 快捷指令
+
+    /** 刷新快捷指令列表（落盘后调用）。 */
+    fun refreshShortcuts() {
+        _shortcuts.value = runCatching { shortcutStore.all() }.getOrDefault(emptyList())
+    }
+
+    /** 保存一条快捷指令（菜单「转为快捷指令」，带用户填的名字）。 */
+    fun saveShortcut(title: String, body: String) {
+        val saved = shortcutStore.upsert(title, body) ?: run {
+            _chatState.value = _chatState.value.copy(message = "这条消息是空的，没能建成快捷指令")
+            return
+        }
+        refreshShortcuts()
+        _chatState.value = _chatState.value.copy(message = "已保存快捷指令「${saved.title}」")
+    }
+
+    /** 一键把消息加进快捷指令列表（菜单「添加到快捷指令列表」，名字自动取首行）。 */
+    fun addShortcutFromMessage(id: String) {
+        val text = chatMessage(id)?.let { it.text.ifBlank { it.toolOutput } }.orEmpty()
+        if (text.isBlank()) return
+        saveShortcut(shortcutStore.suggestTitle(text), text)
+    }
+
+    fun deleteShortcut(id: String) {
+        shortcutStore.remove(id)
+        refreshShortcuts()
+        _chatState.value = _chatState.value.copy(message = "已删除快捷指令")
+    }
+
+    /** 点快捷指令：正文进输入框并计数（不自动发送，发不发由用户决定）。 */
+    fun useShortcut(id: String) {
+        val item = _shortcuts.value.firstOrNull { it.id == id } ?: return
+        shortcutStore.markRun(id)
+        refreshShortcuts()
+        pushComposerDraft(item.body)
+        _chatState.value = _chatState.value.copy(message = "已填入「${item.title}」，可直接发送或改一改")
+    }
+
+    // ------------------------------------------------------------ 输入框草稿（回滚 / 快捷指令回填）
+
+    private val _composerDraft = MutableStateFlow<String?>(null)
+
+    /** 非空 = 有一次「把这段文字放进输入框」的请求，UI 消费后须调用 [consumeComposerDraft]。 */
+    val composerDraft: StateFlow<String?> = _composerDraft.asStateFlow()
+
+    fun pushComposerDraft(text: String) {
+        _composerDraft.value = text
+    }
+
+    fun consumeComposerDraft() {
+        _composerDraft.value = null
+    }
+
+    /** 清空当前会话的消息（保留会话本身）。 */
+    fun clearChat() {
+        _chatState.value = _chatState.value.copy(messages = emptyList(), contextTokens = 0, message = "")
+        persistChat()
+    }
+
+    /** 删除全部会话记录（保留工作台开关与模型标签）。 */
+    fun clearAllChatSessions() {
+        chatJob?.cancel()
+        chatJob = null
+        approvalBroker.reset()
+        chatStore.clear()
+        val current = _chatState.value
+        _chatState.value = AiChatUiState(
+            contextLimit = current.contextLimit,
+            maxTokens = current.maxTokens,
+            modelLabel = current.modelLabel,
+            providerLabel = current.providerLabel,
+            online = current.online,
+            allowCommand = current.allowCommand,
+            allowWrite = current.allowWrite
+        )
+        refreshWorkbenchPanels()
+    }
+
+    // ---------- 内部实现 ----------
+
+    private fun ensureSession(firstMessage: String): String {
+        _chatState.value.activeSessionId?.let { return it }
+        val id = chatStore.newSessionId()
+        _chatState.value = _chatState.value.copy(activeSessionId = id)
+        val now = System.currentTimeMillis()
+        chatStore.save(
+            AiSessionMeta(id, chatStore.titleFrom(firstMessage), 0, 0, now, now),
+            emptyList()
+        )
+        return id
+    }
+
+    /** 落盘当前会话（streaming 标记不写入：重启后不可能还有流在跑）。 */
+    private fun persistChat() {
+        val sessionId = _chatState.value.activeSessionId ?: return
+        val messages = _chatState.value.messages.map { if (it.streaming) it.copy(streaming = false) else it }
+        val existing = _chatState.value.sessions.firstOrNull { it.id == sessionId }
+        val tokens = messages.sumOf { estimateTokens(it.text) + estimateTokens(it.reasoning) }
+        chatStore.save(
+            AiSessionMeta(
+                id = sessionId,
+                title = existing?.title ?: chatStore.titleFrom(messages.firstOrNull { it.role == AiMessageRole.USER }?.text.orEmpty()),
+                messageCount = messages.size,
+                tokens = tokens,
+                createdAt = existing?.createdAt ?: System.currentTimeMillis(),
+                updatedAt = System.currentTimeMillis(),
+                model = _chatState.value.modelLabel
+            ),
+            messages
+        )
+        _chatState.value = _chatState.value.copy(sessions = chatStore.metas(), contextTokens = tokens)
+    }
+
+    /** 组装历史：**包含助手自己的回复**，并按上下文预算从最旧处丢弃（至少保留最近 2 轮）。 */
+    private fun buildChatHistory(): List<Pair<String, String>> {
+        val settings = com.nebulaforge.core.agent.AiProviderSettingsStore(this).load()
+        val all = _chatState.value.messages
+            // 长按菜单的两个开关在这里生效：移出上下文的不再拼进提示词；钉住的永远进。
+            .filter { it.role != AiMessageRole.TOOL && it.error == null && it.text.isNotBlank() && !it.excludedFromContext }
+            .map { message ->
+                val role = if (message.role == AiMessageRole.USER) "user" else "assistant"
+                // 历史轮次的附件只留文件名，正文只在当轮拼（见 launchCompletion）。
+                val suffix = message.attachments.takeIf { it.isNotEmpty() }
+                    ?.joinToString(prefix = "（附件：", postfix = "）") { it.name }
+                    .orEmpty()
+                role to (message.text + suffix)
+            }
+        val budget = (settings.contextWindow - settings.maxTokens).coerceAtLeast(2048)
+        val kept = ArrayDeque<Pair<String, String>>()
+        var used = 0
+        for (pair in all.asReversed()) {
+            val cost = estimateTokens(pair.second)
+            if (used + cost > budget && kept.size >= 2) break
+            used += cost
+            kept.addFirst(pair)
+        }
+        // 钉住的消息即使被预算裁掉也要保留：用户钉它就是为了「一直记得」，被静默丢掉等于没钉。
+        val pinned = _chatState.value.messages
+            .filter { it.pinned && !it.excludedFromContext && it.error == null && it.text.isNotBlank() }
+            .map { (if (it.role == AiMessageRole.USER) "user" else "assistant") to it.text }
+        val dropped = pinned.filterNot { kept.contains(it) }
+        return (dropped + kept.toList()).takeLast(200)
+    }
+
+    /**
+     * 发起一次生成。[continueMode] 为 true 时不再追加用户消息，而是附加一条「继续」指令
+     * （用于 max_tokens 截断后的续写）。
+     */
+    /** 单条消息最多允许的「模型 ↔ 工具」往返轮数：太少完不成多步任务，太多会白烧 token。 */
+    /**
+     * 单轮任务允许的工具调用轮数。
+     *
+     * 原值 8 对「改十几个文件 + 编译验证」这类真实任务太短：模型会在半路被硬截断，
+     * 用户看到的就是「AI 干到一半自己停了、还要我再催一次」。
+     */
+    private val maxToolRounds = 20
+
+    /**
+     * 「没调工具」时的强约束重试提示。
+     *
+     * 真机现象：走 AI 聚合网关（网页 AI）时，模型常给出漂亮的自然语言方案，却**一个工具调用都没有** ——
+     * 任务台于是直接收工，用户看到的就是「网关连上了却用不上工作台的能力」。
+     * 这里不换站点、不抓任何网络请求/响应，只是在**文本层**再问一次，并要求它只输出一个围栏块。
+     */
+    private val strictToolRetryPrompt = buildString {
+        append("（系统）你上一条回复里没有任何可执行的工具调用。\n")
+        append("如果你还需要了解项目事实、或需要动手执行，请**只输出一个围栏代码块**，不要写任何解释：\n")
+        append("```tool\n{\"name\":\"工具名\",\"arguments\":{}}\n```\n")
+        append("如果你确认任务已经完成，请直接给出结论（不要输出 JSON）。")
+    }
+
+    /**
+     * 第二次强约束（比第一次更硬）：带上当前**真实可用**的工具名，要求逐字照抄。
+     * 仍只在文本层追问答 —— 不换站点、不拦截/不重放任何网络请求与响应。
+     */
+    private fun hardToolRetryPrompt(allowed: Set<String>): String = buildString {
+        append("（系统·最后提醒）你连续两条回复都没有任何工具调用，任务台不会替你猜。\n")
+        append("现在只允许输出下面两种之一，其它文字一律不要写：\n")
+        append("1) 一个围栏代码块：\n```tool\n{\"name\":\"工具名\",\"arguments\":{}}\n```\n")
+        append("2) 以「无需工具」开头的一句话（仅当确实不需要任何工具时）。\n")
+        val names = com.nebulaforge.core.agent.AgentToolCatalog.specsFor(allowed).joinToString("、") { it.name }
+        if (names.isNotBlank()) append("当前可用工具名（必须逐字照抄，不许改名/翻译）：$names")
+    }
+
+    /**
+     * 模型死活不动手时的**确定性兜底**：工作台自己先跑一轮**只读**侦察（列目录 + 读关键文件），
+     * 把真实项目事实喂回上下文。这样即使模型不听话，「工作台能力」也真的被调用过一次，
+     * 而且下一轮模型拿到的是真实事实，而不是继续空谈方案。
+     */
+    private suspend fun localRecon(toolset: Set<String>): List<Pair<AiToolCall, AiToolResult>> {
+        if (workspaceState.state.value.projectPath.isNullOrBlank()) return emptyList()
+        val catalog = com.nebulaforge.core.agent.AgentToolCatalog
+        val out = mutableListOf<Pair<AiToolCall, AiToolResult>>()
+        fun call(name: String, path: String) =
+            AiToolCall(name = name, arguments = org.json.JSONObject().put("path", path), rawJson = "")
+        if (catalog.LIST_FILES in toolset) {
+            val c = call(catalog.LIST_FILES, ".")
+            out += c to taskToolHost.execute(c, toolset)
+        }
+        listOf("README.md", "pubspec.yaml", "build.gradle.kts", "settings.gradle.kts", "package.json", "app.json")
+            .forEach { rel ->
+                if (out.size >= 3 || catalog.READ_FILE !in toolset) return@forEach
+                val c = call(catalog.READ_FILE, rel)
+                val r = taskToolHost.execute(c, toolset)
+                if (r.ok) out += c to r
+            }
+        return out
+    }
+
+    /** 「自动侦察」也要做成工具卡片，让用户看得见工作台确实动手了。 */
+    private fun appendReconCards(recon: List<Pair<AiToolCall, AiToolResult>>) {
+        recon.forEach { (call, result) ->
+            _chatState.value = _chatState.value.copy(
+                messages = _chatState.value.messages + AiChatMessage(
+                    role = AiMessageRole.TOOL,
+                    text = "自动侦察 · ${describeToolCall(call)}",
+                    toolName = result.name,
+                    toolOutput = result.output,
+                    toolExitCode = result.exitCode,
+                    streaming = false,
+                    error = if (result.ok) null else result.output.take(200)
+                )
+            )
+        }
+    }
+
+    /**
+     * MCP 实时目录：Server 与工具都是动态的（内置项目服务 + 用户接入的远端服务），
+     * 现查现拼进系统提示词，模型才知道「完整功能」里到底有哪些可调。
+     */
+    private fun buildMcpCatalog(): String {
+        val host = mcpToolHost ?: return ""
+        return host.serverIds().joinToString("\n") { id ->
+            val snapshot = host.snapshotOf(id)
+            val tools = if (snapshot?.internal == true) host.internalTools(id) else host.remoteToolDefinitions(id)
+            val state = when {
+                snapshot?.internal == true -> "内置"
+                snapshot?.connected == true -> "已就绪"
+                else -> snapshot?.state?.name ?: "未探测"
+            }
+            val names = tools.joinToString("、") { "${it.name}（${it.description.replace("\n", " ").take(40)}）" }
+            "- $id  [$state]  工具：${names.ifBlank { "（未探测到，可在面板点探测）" }}"
+        }
+    }
+
+    /** 当前 MCP Server 真实暴露的工具名（用于协议准入放宽：模型直呼其名也能落地）。 */
+    private fun mcpToolNames(): Set<String> {
+        val host = mcpToolHost ?: return emptySet()
+        return host.serverIds().flatMap { id ->
+            (if (host.snapshotOf(id)?.internal == true) host.internalTools(id) else host.remoteToolDefinitions(id))
+                .map { it.name }
+        }.toSet()
+    }
+
+    /**
+     * 上一轮「看起来想调工具、却一个都没解析出来」时才值得再问一次；
+     * 纯聊天（没有围栏、没提任何工具名）不打扰，避免平白多花一次请求。
+     */
+    private fun needsToolRetry(raw: String): Boolean {
+        if (raw.isBlank()) return true
+        if (raw.contains("```")) return true
+        val lower = raw.lowercase()
+        if (lower.contains("\"arguments\"")) return true
+        return com.nebulaforge.core.agent.AgentToolCatalog.all.any { lower.contains(it.name) }
+    }
+
+    /**
+     * 任务模式的执行主循环：一次提问 → 模型可反复「调工具 → 看结果 → 继续」→ 最终给结论。
+     *
+     * 与旧「聊天模式」的本质区别（不只是文案）：
+     *  - 系统提示词里带工具协议 + 技能 + 记忆 + 妙招（[com.nebulaforge.core.agent.AgentCapabilities.buildSystemPrompt]）；
+     *  - 模型输出的 ```tool 块被**真实执行**（[com.nebulaforge.app.ai.AiTaskToolHost]），结果回灌后继续推理，
+     *    而不是把 JSON 原样展示给用户；
+     *  - 命令 / 写文件经 [com.nebulaforge.app.ai.TaskApprovalBroker] 挂起等用户点头，被拒绝时
+     *    如实回灌「用户拒绝」，避免模型假装成功；
+     *  - 工具造成的记忆 / 妙招 / 技能变化会立刻刷新侧边面板。
+     */
+    private fun launchCompletion(sessionId: String, continueMode: Boolean = false) {
+        val settings = com.nebulaforge.core.agent.AiProviderSettingsStore(this).load()
+        // 后端不再只认「在线 API 服务商」：没配 API、但已经在「网桥」里接好了网页 AI（AI 聚合网关）时，
+        // 任务台同样能开工 —— 这正是「AI 网关无法调用 AI 任务台」的修复点（见 CompletionBackend.kt）。
+        val backend = when (val choice = com.nebulaforge.app.ai.resolveCompletionBackend(this, settings)) {
+            is com.nebulaforge.app.ai.BackendChoice.Ready -> choice.backend
+            is com.nebulaforge.app.ai.BackendChoice.Unavailable -> {
+                _chatState.value = _chatState.value.copy(
+                    busy = false,
+                    phase = AiTaskPhase.ERROR,
+                    message = choice.message
+                )
+                return
+            }
+        }
+
+        val snapshot = _chatState.value
+        val projectPath = workspaceState.state.value.projectPath
+        val toolset = capabilities.toolset(snapshot.online, snapshot.allowCommand, snapshot.allowWrite)
+        val lastUser = snapshot.messages.lastOrNull { it.role == AiMessageRole.USER }
+        val attachments = lastUser?.attachments.orEmpty()
+        val memoryContext = capabilities.buildProjectContext(projectPath, lastUser?.text.orEmpty())
+        // 根因③修复：项目级 MCP Server（含 run_build 等）原先只在 WorkspaceScreen 打开时注册，
+        // AI 工作台里 mcp_call 看不到它。这里在开工前按当前项目幂等注册（已注册则跳过，不覆盖界面那份）。
+        // 逆向 Server 保底注册（幂等）：AI 任务运行时此刻一定可调 apk_reverse/web_reverse/api_reverse/ca_certificate，
+        // 并且 mcp_call 里能看到 reverse_* 工具。
+        runCatching { ensureReverseMcpRegistered() }
+        projectPath?.let { ensureProjectMcpRegistered(java.io.File(it)) }
+        val mcpCatalog = buildMcpCatalog()
+        val system = capabilities.buildSystemPrompt(
+            projectPath = projectPath,
+            toolset = toolset,
+            attachments = attachments,
+            online = snapshot.online,
+            allowCommand = snapshot.allowCommand,
+            allowWrite = snapshot.allowWrite,
+            memoryContext = memoryContext,
+            // MCP 目录现查现拼：让「完整功能」里的动态能力对模型可见（以前 MCP 只挂在界面上）。
+            mcpCatalog = mcpCatalog
+        )
+        // 诊断日志：以后真机验证只需读 logcat（tag=NbAiLoop），不必再驱动手机界面。
+        android.util.Log.i(
+            "NbAiLoop",
+            "start backend=${backend.label}/${backend.providerLabel} toolset(${toolset.size})=${toolset.sorted()} " +
+                "mcp目录行=${mcpCatalog.lineSequence().count()} 在线=${snapshot.online} 命令=${snapshot.allowCommand} 写文件=${snapshot.allowWrite} " +
+                "项目=${projectPath ?: "(未打开)"} user=${lastUser?.text?.take(60)?.replace("\n", " ")}"
+        )
+        val images = attachments.filter { it.isImage && it.imageBase64.isNotBlank() }
+            .map { com.nebulaforge.core.aiprovider.ChatImage(it.mime.ifBlank { "image/jpeg" }, it.imageBase64) }
+        // 网页网关后端没有「上传图片」的通道：必须显式告知，否则用户只会得到「传了但 AI 毫无反应」，
+        // 看起来就跟「图片上传失败」一模一样（这正是真机反馈的那条）。
+        if (images.isNotEmpty() && !backend.supportsImages) {
+            android.util.Log.w("NbAttach", "后端 ${backend.label} 不支持图片，${images.size} 张已降级为文字说明")
+            _chatState.value = _chatState.value.copy(
+                messages = _chatState.value.messages + AiChatMessage(
+                    role = AiMessageRole.TOOL,
+                    text = "⚠️ 当前后端「${backend.label}」不支持图片识别：本轮 ${images.size} 张图片只发了文件名与路径，" +
+                        "图像内容没有上传。需要看图请到 AI 设置切换到支持多模态的 API 后端（如 GPT-4o / Qwen-VL 等），" +
+                        "也可以直接让 AI 用命令分析这些路径。"
+                )
+            )
+        }
+        val history = buildChatHistory().toMutableList()
+        // 附件正文只拼在「最后一条用户消息」上：历史轮次重复塞正文既浪费 token，也会让图片与提问错位。
+        // 附件正文共享一份字符预算：一次挂十来个包时不能每个都吃 4 万字符，否则上下文必爆。
+        val textAttachments = attachments.filter { !it.isImage }
+        val perAttachmentChars = if (textAttachments.isEmpty()) 0
+            else (60_000 / textAttachments.size).coerceIn(4_000, 40_000)
+        val attachmentBlocks = textAttachments.joinToString("") { it.promptBlock(perAttachmentChars) }
+        if (attachmentBlocks.isNotBlank()) {
+            val index = history.indexOfLast { it.first != "assistant" }
+            if (index >= 0) history[index] = history[index].first to (history[index].second + attachmentBlocks)
+        }
+        if (continueMode) history += "user" to "上面的回答被截断了，请从中断处继续，不要重复已写过的内容。"
+        if (history.isEmpty()) history += "user" to (lastUser?.text?.takeIf { it.isNotBlank() } ?: "你好")
+
+        _chatState.value = _chatState.value.copy(
+            busy = true,
+            streaming = true,
+            phase = AiTaskPhase.THINKING,
+            toolRounds = 0,
+            message = "",
+            taskStartedAt = if (_chatState.value.taskStartedAt > 0L) _chatState.value.taskStartedAt else System.currentTimeMillis(),
+            taskFinishedAt = 0L,
+            contextLimit = backend.contextWindow,
+            maxTokens = backend.maxTokens,
+            modelLabel = backend.label,
+            providerLabel = backend.providerLabel
+        )
+
+        chatJob = agentScope.launch {
+            val options = com.nebulaforge.core.aiprovider.ChatOptions(
+                maxTokens = backend.maxTokens,
+                temperature = settings.temperature,
+                stream = true
+            )
+            var rounds = 0
+            // 「没调工具」的强约束重试：最多两次（第二次更硬，并带上真实工具名），
+            // 真机现象是模型方案写得漂亮却一次都不动手 —— 这里就是逼它动手的地方。
+            var toolRetries = 0
+            // 模型连强约束都不听时，由工作台自己跑一轮只读侦察（只做一次），保证能力真的被调用。
+            var reconUsed = false
+            try {
+                while (true) {
+                    rounds++
+                    val placeholderId = UUID.randomUUID().toString()
+                    _chatState.value = _chatState.value.copy(
+                        messages = _chatState.value.messages + AiChatMessage(
+                            id = placeholderId, role = AiMessageRole.ASSISTANT, text = "",
+                            streaming = true, model = backend.label
+                        ),
+                        phase = AiTaskPhase.THINKING
+                    )
+                    val buffer = StringBuilder()
+                    var lastFlushAt = 0L
+                    val onDelta: (String) -> Unit = { delta ->
+                        buffer.append(delta)
+                        val now = System.currentTimeMillis()
+                        // 节流：每个 token 都刷新 StateFlow 会让长回答明显掉帧。
+                        if (now - lastFlushAt >= 60) {
+                            lastFlushAt = now
+                            updateChatMessage(placeholderId, buffer.toString(), streaming = true)
+                        }
+                    }
+                    val result = backend.complete(
+                        system = system,
+                        history = history.toList(),
+                        // 图片只在本轮首回合附带（多轮里重复塞图既浪费带宽也容易被服务端拒）；
+                        // 网页网关后端不支持图片，传空即可（提示词里已说明）。
+                        images = if (rounds == 1 && backend.supportsImages) images else emptyList(),
+                        options = options,
+                        onDelta = onDelta,
+                        onStatus = { status ->
+                            _chatState.value = _chatState.value.copy(phase = AiTaskPhase.THINKING, message = status)
+                        }
+                    )
+
+                    val raw = buffer.toString()
+                    // 准入放宽到「真实可执行工具」：静态目录 + 当前 MCP Server 现暴露的工具名。
+                    // 网关模型写 ```json / 裸 JSON 时也认，避免「答得对但一次都不动手」。
+                    val calls = AiToolProtocol.parse(raw, extraKnown = mcpToolNames())
+                    android.util.Log.i(
+                        "NbAiLoop",
+                        "round=$rounds rawLen=${raw.length} calls=${calls.map { it.name }} retries=$toolRetries 围栏=${raw.contains("```")}"
+                    )
+                    updateChatMessage(
+                        placeholderId,
+                        AiToolProtocol.stripBlocks(raw, extraKnown = mcpToolNames()),
+                        reasoning = result.reasoning.ifBlank { null },
+                        streaming = false,
+                        // 还要继续调工具时，把 finishReason 留空，避免误报「被截断」而诱导用户点继续。
+                        finishReason = if (calls.isEmpty()) result.finishReason else "",
+                        tokens = if (result.usage.completionTokens > 0) result.usage.completionTokens else estimateTokens(raw)
+                    )
+
+                    if (calls.isEmpty()) {
+                        // 网关（网页 AI）最典型的失败：方案写得挺好，却没有一个工具调用。
+                        // 不换站点、不拦截/不重放任何网络请求与响应 —— 只在文本层再追问，
+                        // 它要么真的调工具，要么明确收尾，用户不会再看到「连上了却什么都没做」。
+                        if (toolRetries < 2 && rounds < maxToolRounds && needsToolRetry(raw)) {
+                            toolRetries++
+                            history += "assistant" to raw
+                            history += "user" to
+                                if (toolRetries == 1) strictToolRetryPrompt else hardToolRetryPrompt(toolset)
+                            android.util.Log.i("NbAiLoop", "noToolCall 第${toolRetries}次强约束重试 round=$rounds")
+                            _chatState.value = _chatState.value.copy(
+                                phase = AiTaskPhase.THINKING,
+                                message = "模型没有给出工具调用，正在要求它改用工具协议重试（第 $toolRetries 次）…"
+                            )
+                            continue
+                        }
+                        // 模型死活不动手：工作台自己先做一轮**只读侦察**，保证能力真的被调用，
+                        // 同时把真实项目事实喂回去 —— 比继续空谈方案有用得多。
+                        if (!reconUsed && rounds < maxToolRounds) {
+                            reconUsed = true
+                            val recon = kotlinx.coroutines.withTimeoutOrNull(90_000) { localRecon(toolset) }.orEmpty()
+                            if (recon.isNotEmpty()) {
+                                android.util.Log.i(
+                                    "NbAiLoop",
+                                    "localRecon=${recon.joinToString(",") { "${it.second.name}:${if (it.second.ok) "ok" else "fail"}" }}"
+                                )
+                                history += "assistant" to raw
+                                appendReconCards(recon)
+                                history += "user" to (
+                                    AiToolProtocol.renderResults(recon.map { it.second }) +
+                                        "\n（以上是工作台自动做的一轮只读侦察结果。请基于这些**真实事实**继续：需要动手就直接给 ```tool 调用。）"
+                                    )
+                                _chatState.value = _chatState.value.copy(
+                                    phase = AiTaskPhase.TOOL,
+                                    message = "模型未动手，工作台已自动侦察项目（${recon.size} 个工具）…"
+                                )
+                                continue
+                            }
+                        }
+                        android.util.Log.i("NbAiLoop", "done rounds=$rounds 无工具调用，收工 rawLen=${raw.length}")
+                        completeActivePlan()
+                        _chatState.value = _chatState.value.copy(
+                            busy = false,
+                            streaming = false,
+                            phase = AiTaskPhase.DONE,
+                            taskFinishedAt = System.currentTimeMillis(),
+                            lastPromptTokens = result.usage.promptTokens,
+                            lastCompletionTokens = result.usage.completionTokens,
+                            contextTokens = _chatState.value.messages.sumOf { estimateTokens(it.text) + estimateTokens(it.reasoning) },
+                            message = if (result.truncatedByLength)
+                                "回答达到 max_tokens（${backend.maxTokens}）被截断，可点「继续」接着写" else ""
+                        )
+                        break
+                    }
+
+                    if (rounds >= maxToolRounds) {
+                        _chatState.value = _chatState.value.copy(
+                            busy = false,
+                            streaming = false,
+                            phase = AiTaskPhase.DONE,
+                            taskFinishedAt = System.currentTimeMillis(),
+                            message = "本次已达到 $maxToolRounds 轮工具调用上限，请把任务拆小一些再继续"
+                        )
+                        break
+                    }
+
+                    // 模型自己「说了什么 + 调了什么」都要进历史，否则下一轮它会重复调用同一个工具。
+                    history += "assistant" to raw
+                    _chatState.value = _chatState.value.copy(phase = AiTaskPhase.TOOL, toolRounds = rounds)
+
+                    val results = mutableListOf<AiToolResult>()
+                    calls.forEach { call ->
+                        val cardId = UUID.randomUUID().toString()
+                        _chatState.value = _chatState.value.copy(
+                            messages = _chatState.value.messages + AiChatMessage(
+                                id = cardId,
+                                role = AiMessageRole.TOOL,
+                                text = describeToolCall(call),
+                                toolName = call.name,
+                                toolOutput = "执行中…",
+                                streaming = true,
+                                // ★ 工具卡片计时起点：运行中实时走表，结束后固定为总用时。
+                                toolStartedAt = System.currentTimeMillis()
+                            )
+                        )
+                        // ★ 硬超时兜底：任何工具（含 MCP / 网关 / 审批等待）都不允许无限挂起，
+                        //   否则卡片会永远停在「执行中…」。工具自带 timeout_seconds 时按它算，
+                        //   否则 30 分钟封顶；超时判定为卡死并请求停掉底层任务（构建/gradle 进程）。
+                        val toolTimeoutMs = (runCatching { call.arguments.optDouble("timeout_seconds", 0.0) }
+                            .getOrDefault(0.0) * 1000).toLong().takeIf { it > 0L }
+                            ?.coerceIn(60_000L, 3_600_000L) ?: 1_800_000L
+                        val outcome = kotlinx.coroutines.withTimeoutOrNull(toolTimeoutMs) {
+                            taskToolHost.execute(call, toolset)
+                        } ?: run {
+                            runCatching { workspaceTasks.stop() }
+                            android.util.Log.w("NbAiLoop", "tool=${call.name} 硬超时 ${toolTimeoutMs}ms，已终止")
+                            AiToolResult(
+                                callId = call.id, name = call.name, ok = false, exitCode = 124,
+                                output = "✗ 工具 ${call.name} 超过 ${toolTimeoutMs / 60_000} 分钟仍未返回，判定卡死并已终止（已请求停掉底层任务）。\n" +
+                                    "排查建议：看「任务」面板里这次调用的输出尾部；构建/安装类操作常见原因是卡在下载依赖或等锁。"
+                            )
+                        }
+                        android.util.Log.i(
+                            "NbAiLoop",
+                            "tool=${outcome.name} ok=${outcome.ok} exit=${outcome.exitCode} out=${outcome.output.replace("\n", " ").take(140)}"
+                        )
+                        updateToolMessage(cardId, outcome)
+                        results += outcome
+                    }
+                    if (results.any { it.stateChanged }) refreshWorkbenchPanels()
+                    history += "user" to AiToolProtocol.renderResults(results)
+                    persistChat()
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                settleStreamingCards("已停止（任务被中断，工具未返回结果）")
+                _chatState.value = _chatState.value.copy(
+                    busy = false, streaming = false, phase = AiTaskPhase.IDLE,
+                    taskFinishedAt = System.currentTimeMillis(), message = "已停止"
+                )
+                throw e
+            } catch (t: Throwable) {
+                // ★ 先收尾所有挂着的工具卡片（旧代码只收尾最后一条助手消息 → 卡片永远「执行中…」）。
+                settleStreamingCards("任务异常终止：" + (t.message ?: t.javaClass.simpleName))
+                val streaming = _chatState.value.messages.lastOrNull { it.streaming }
+                if (streaming != null) {
+                    updateChatMessage(streaming.id, streaming.text, streaming = false, error = t.message ?: t.javaClass.simpleName)
+                } else {
+                    _chatState.value = _chatState.value.copy(
+                        messages = _chatState.value.messages + AiChatMessage(
+                            role = AiMessageRole.ASSISTANT, text = "", error = t.message ?: t.javaClass.simpleName
+                        )
+                    )
+                }
+                // ★ state.message 的渲染位置在消息列表**之外**、不受滚动容器约束：
+                //   真机上把一长串「3 个站点都没成功 + 每站取证」塞进来，会把输入框直接顶出屏幕，
+                //   用户看到的就是「失败后卡在这一页、回不到 AI 工作台」。这里只留一行摘要，
+                //   完整原因已经在上面的消息气泡里（error = t.message）。
+                val full = t.message ?: t.javaClass.simpleName
+                _chatState.value = _chatState.value.copy(
+                    busy = false,
+                    streaming = false,
+                    phase = AiTaskPhase.ERROR,
+                    taskFinishedAt = System.currentTimeMillis(),
+                    message = "任务执行失败：" + full.lineSequence().first().take(110) +
+                        if (full.length > 110) "（详见下方消息）" else ""
+                )
+            } finally {
+                // 任务结束必须解开挂起的审批，否则用户停止后协程会永远卡在 awaitApproval 上。
+                approvalBroker.reset()
+                // 后端可能有需要收尾的资源（聚合网关会释放网桥进度回调等）。
+                runCatching { backend.close() }
+                persistChat()
+            }
+        }
+    }
+
+    /** 工具卡片标题：把参数里最关键的字段提出来，让用户一眼看懂这次调用在做什么。 */
+    private fun describeToolCall(call: AiToolCall): String {
+        val args = call.arguments
+        val detail = when (call.name) {
+            com.nebulaforge.core.agent.AgentToolCatalog.RUN_COMMAND ->
+                args.optString("command").ifBlank { args.optString("cmd") }
+            com.nebulaforge.core.agent.AgentToolCatalog.READ_FILE,
+            com.nebulaforge.core.agent.AgentToolCatalog.LIST_FILES -> args.optString("path").ifBlank { "." }
+            com.nebulaforge.core.agent.AgentToolCatalog.GREP_PROJECT -> args.optString("pattern")
+            com.nebulaforge.core.agent.AgentToolCatalog.WEB_SEARCH -> args.optString("query").ifBlank { args.optString("q") }
+            com.nebulaforge.core.agent.AgentToolCatalog.FETCH_PAGE -> args.optString("url")
+            com.nebulaforge.core.agent.AgentToolCatalog.WRITE_FILE -> args.optString("path")
+            com.nebulaforge.core.agent.AgentToolCatalog.RUN_SKILL -> args.optString("id").ifBlank { args.optString("name") }
+            com.nebulaforge.core.agent.AgentToolCatalog.REMEMBER -> args.optString("key").ifBlank { args.optString("title") }
+            com.nebulaforge.core.agent.AgentToolCatalog.MCP_CALL ->
+                listOf(args.optString("server"), args.optString("tool"), args.optString("name"))
+                    .filter { it.isNotBlank() }.joinToString(" / ")
+            com.nebulaforge.core.agent.AgentToolCatalog.BUILD_PROJECT ->
+                args.optString("task").ifBlank { args.optString("module").ifBlank { "默认构建" } }
+            com.nebulaforge.core.agent.AgentToolCatalog.RUN_APP -> "构建并运行到设备"
+            com.nebulaforge.core.agent.AgentToolCatalog.TOOLCHAIN_STATUS -> "构建环境自检"
+            com.nebulaforge.core.agent.AgentToolCatalog.CREATE_PROJECT ->
+                args.optString("name").ifBlank { args.optString("template") }
+            else -> args.toString().take(120)
+        }
+        return if (detail.isBlank()) call.name else "${call.name}  $detail"
+    }
+
+    private fun updateToolMessage(id: String, result: AiToolResult) {
+        _chatState.value = _chatState.value.copy(
+            messages = _chatState.value.messages.map { message ->
+                if (message.id != id) message
+                else message.copy(
+                    toolOutput = result.output,
+                    toolExitCode = result.exitCode,
+                    streaming = false,
+                    toolFinishedAt = System.currentTimeMillis(),
+                    error = if (result.ok) null else result.output.take(200)
+                )
+            }
+        )
+    }
+
+    private fun updateChatMessage(
+        id: String,
+        text: String,
+        reasoning: String? = null,
+        streaming: Boolean = false,
+        finishReason: String = "",
+        tokens: Int = 0,
+        error: String? = null
+    ) {
+        _chatState.value = _chatState.value.copy(
+            messages = _chatState.value.messages.map { message ->
+                if (message.id != id) message
+                else message.copy(
+                    text = text,
+                    reasoning = reasoning ?: message.reasoning,
+                    streaming = streaming,
+                    finishReason = finishReason.ifBlank { message.finishReason },
+                    tokens = if (tokens > 0) tokens else message.tokens,
+                    error = error ?: message.error
+                )
+            }
+        )
+    }
+
+    /**
+     * 把 Agent 计划里**已结束**的步骤转成工具卡片消息（对应图 3 那种
+     * 「shizuku_exec command: … / N 行」可展开卡片）。按「步骤 id + 状态」去重，
+     * 避免同一调用被重复插入。
+     */
+    private fun syncPlanToolCards(plan: com.nebulaforge.core.agent.AgentPlan) {
+        val sessionId = _chatState.value.activeSessionId ?: return
+        var added = false
+        plan.steps.forEach { step ->
+            val finished = step.status == com.nebulaforge.core.agent.AgentPlanStepStatus.COMPLETED ||
+                step.status == com.nebulaforge.core.agent.AgentPlanStepStatus.FAILED
+            if (!finished || step.output.isBlank()) return@forEach
+            val key = "${plan.userRequest.hashCode()}:${step.id}:${step.status}"
+            if (!recordedToolSteps.add(key)) return@forEach
+            added = true
+            _chatState.value = _chatState.value.copy(
+                messages = _chatState.value.messages + AiChatMessage(
+                    role = AiMessageRole.TOOL,
+                    text = step.title,
+                    toolName = step.action.name.lowercase(),
+                    toolOutput = step.output,
+                    toolExitCode = if (step.status == com.nebulaforge.core.agent.AgentPlanStepStatus.FAILED) 1 else 0
+                )
+            )
+        }
+        if (added && sessionId.isNotBlank()) persistChat()
+    }
+}
+
+data class AgentPlanUiState(
+    val plan: com.nebulaforge.core.agent.AgentPlan? = null,
+    val busy: Boolean = false,
+    val message: String = ""
+)
