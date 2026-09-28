@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 读取当前活动网络的 DNS 服务器，供内置 guest（proot）生成 resolv.conf 使用：
+         设备本身没有 /etc/resolv.conf（解析走 netd 代理），而 proot 内走不通该代理。 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- 项目本体落在公共存储 /storage/emulated/0/NebulaForgeProjects，需要读写外部存储。 -->
+    <!-- targetSdk 35 起 READ/WRITE_EXTERNAL_STORAGE 对公共目录不再生效，故同时申请 MANAGE_EXTERNAL_STORAGE。 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <!-- Shizuku 提权通道：授权后以 shell(uid=2000) 身份执行命令（AI 终端 / 设备操作）。 -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+
+    <!-- 安装构建产物：系统安装器兜底（ACTION_VIEW + FileProvider）需要这个权限；
+         静默安装走 Shizuku/Root 的 pm install，不依赖它。API 26+ 还需用户在系统里
+         放行「安装未知应用」，UI 会一键跳到该设置页。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- 任务（构建/运行）前台服务：长任务必须让进程脱离 cached 状态，否则用户切到别的应用后
+         系统（尤其 EMUI）会把进程整组压进 freezer cgroup 冻结，任务停在「运行中 Ns」且零输出。
+         真机取证见 TaskForegroundService 的类注释。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:name=".NebulaForgeApplication"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.NebulaForge">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.NebulaForge"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- AI 网关（网页 AI）的全屏浏览器宿主。必须是独立 Activity＋真实 window：
+             WebView 挂在 Compose 区域会被 StopAllLoaders/DetachFromFrame（ERR_ABORTED -3），
+             挂在 Compose Dialog 浮层窗口下则「页面已加载但不合成内容」→ 整屏只画白底。
+             详见 WebAiGatewayActivity 类注释。 -->
+        <activity
+            android:name=".ai.WebAiGatewayActivity"
+            android:exported="false"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.NebulaForge"
+            android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout|uiMode"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- Shizuku 服务连接用的 provider：authorities 必须带 applicationId 前缀。 -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!-- 系统安装器兜底用：把构建产物 APK 以 content:// 交给 ACTION_VIEW，
+             避免 FileUriExposedException。覆盖 filesDir（Flutter 暂存产物）与公共存储（Gradle 产物）。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/nf_file_paths" />
+        </provider>
+        <!-- 构建 / 运行期间的前台服务：防止进程被系统冻结（cgroup freezer）导致任务假死。
+             targetSdk=28 时不需要 FGS 类型，这里显式声明 dataSync 以便日后提高 targetSdk。 -->
+        <service
+            android:name=".build.TaskForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+    </application>
+
+</manifest>
