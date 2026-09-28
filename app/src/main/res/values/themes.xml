@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose 场景下作为 Activity 启动前的过渡主题，实际配色由 core-ui-theme 的 NebulaForgeTheme 接管 -->
+    <style name="Theme.NebulaForge" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">#DCEEF7</item>
+        <item name="android:windowBackground">#F7FBFD</item>
+    </style>
+</resources>
