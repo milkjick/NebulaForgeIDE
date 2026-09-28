@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.22.1)
+project(nebulapty)
+add_library(nebulapty SHARED pty_jni.cpp)
+find_library(log-lib log)
+target_link_libraries(nebulapty ${log-lib} c++_static c++abi)
