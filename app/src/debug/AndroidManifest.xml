@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  【仅 debug 包】调试用 manifest 覆盖层。
+
+  为什么需要：聚合网关的失败现场（未登录 / 风控 / 消息没落地 / 页面空壳）只有
+  在真机上跑一轮真实的网页 AI 收发才看得出来，而用户的手机通常拿不到 adb。
+  这里把网关面板 Activity 在 **debug 包**里导出，配合 am start 传 probe 额外参数
+  （见 WebAiGatewayActivity 的 EXTRA_PROBE）就能触发一轮端到端探测，
+  结论写进 files/logs/gateway.log。
+
+  release 包不含本 overlay（主 manifest 仍是 exported=false），无任何对外暴露。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application>
+        <activity
+            android:name=".ai.WebAiGatewayActivity"
+            android:exported="true"
+            tools:replace="android:exported" />
+    </application>
+
+</manifest>
